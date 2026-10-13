@@ -17,3 +17,4 @@ plugins/canvas/*/node_modules
 web/public/pluginsweb/src.bak-*/
 .git_bak/
 web/src.bak-*/
+web/backups/
