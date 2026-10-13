@@ -8,6 +8,7 @@ import CanvasProjectPage from "@/pages/canvas/project";
 import ConfigPage from "@/pages/config";
 import HomePage from "@/pages/home";
 import ImagePage from "@/pages/image";
+import LogsPage from "@/pages/logs";
 import NotFound from "@/pages/not-found";
 import PromptsPage from "@/pages/prompts";
 import VideoPage from "@/pages/video";
@@ -25,6 +26,7 @@ export const router = createBrowserRouter([
             { path: "/image", element: <ImagePage /> },
             { path: "/video", element: <VideoPage /> },
             { path: "/assets", element: <AssetsPage /> },
+            { path: "/logs", element: <LogsPage /> },
             { path: "/prompts", element: <PromptsPage /> },
             { path: "/canvas", element: <CanvasPage /> },
             { path: "/canvas/:id", element: <CanvasProjectPage /> },

@@ -3,6 +3,7 @@ import { ListPlus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { MODEL_PROTOCOLS_BY_CAPABILITY, modelProtocolError, normalizeModelProtocol, type ModelProtocol } from "@/lib/model-protocol";
 import { defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { ModelScriptEditor } from "./model-script-editor";
 import { ModelSelectModal } from "./model-select-modal";
@@ -15,6 +16,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
     const [selectOpen, setSelectOpen] = useState(false);
     const [manualName, setManualName] = useState("");
     const [manualCapability, setManualCapability] = useState<ModelCapability>("text");
+    const [manualProtocol, setManualProtocol] = useState<ModelProtocol>("auto");
     const [scriptTarget, setScriptTarget] = useState<ScriptTarget | null>(null);
     const apiFormatOptions: Array<{ label: string; value: ApiCallFormat }> = [
         { label: t("config.channelEditor.protocols.responses"), value: "openai" },
@@ -23,8 +25,21 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
     ];
     const capabilityOptions: Array<{ label: string; value: ModelCapability }> = ["image", "video", "text", "audio"].map((value) => ({ label: t(`config.channelEditor.capabilities.${value}`), value: value as ModelCapability }));
 
+    const protocolOptions = (capability: ModelCapability) => MODEL_PROTOCOLS_BY_CAPABILITY[capability].map((value) => ({ label: t(`config.channelEditor.modelProtocols.${value}`), value }));
+    const protocolHint = (capability: ModelCapability, protocol: ModelProtocol) => {
+        if (protocol === "custom-script") return t("config.channelEditor.customScriptHint");
+        if (protocol === "auto") return t("config.channelEditor.autoProtocolHint");
+        const endpoint = t(`config.channelEditor.endpoints.${protocol}`);
+        return `${t("config.channelEditor.endpointHint", { endpoint })}${capability === "video" ? ` ${t("config.channelEditor.videoProtocolHint")}` : ""}`;
+    };
+
     useEffect(() => {
-        if (open && channel) setDraft(channel);
+        if (open && channel) {
+            setDraft({ ...channel, models: normalizeChannelModels(channel.models) });
+            setManualName("");
+            setManualCapability("text");
+            setManualProtocol("auto");
+        }
     }, [open, channel]);
 
     if (!draft) return null;
@@ -42,11 +57,14 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
         setModels(names.map((name) => map.get(name) || { name, capability: guessCapability(name) }));
     };
 
-    const setCapability = (name: string, capability: ModelCapability) => setModels(draft.models.map((model) => (model.name === name ? { ...model, capability } : model)));
+    const setCapability = (name: string, capability: ModelCapability) => setModels(draft.models.map((model) => (model.name === name && model.capability !== capability ? { ...model, capability, protocol: "auto" } : model)));
+    const setProtocol = (name: string, protocol: ModelProtocol) => setModels(draft.models.map((model) => (model.name === name ? { ...model, protocol } : model)));
+    const missingCustomScript = draft.models.some((model) => Boolean(modelProtocolError(model)));
     const setScript = (name: string, script: string) => setModels(draft.models.map((model) => (model.name === name ? { ...model, script: script || undefined } : model)));
     const removeModel = (name: string) => setModels(draft.models.filter((model) => model.name !== name));
 
     const save = () => {
+        if (missingCustomScript) return;
         onSave({ ...draft, name: draft.name.trim() || t("config.channels.unnamed"), models: normalizeChannelModels(draft.models) });
         onClose();
     };
@@ -61,7 +79,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
             extra={
                 <Space>
                     <Button onClick={onClose}>{t("common.cancel")}</Button>
-                    <Button type="primary" onClick={save}>
+                    <Button type="primary" disabled={missingCustomScript} onClick={save}>
                         {t("common.save")}
                     </Button>
                 </Space>
@@ -96,30 +114,43 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                 </Button>
             </div>
 
+            <p className="mb-3 text-xs text-stone-500">{t("config.channelEditor.capabilityProtocolHint")}</p>
             <div className="mb-3 flex flex-wrap gap-2">
                 <Input className="min-w-40 flex-1" placeholder={t("config.modelSelect.modelName")} value={manualName} onChange={(event) => setManualName(event.target.value)} />
-                <Select value={manualCapability} options={capabilityOptions} onChange={setManualCapability} style={{ width: 100 }} />
-                <Button disabled={!manualName.trim() || draft.models.some((model) => model.name === manualName.trim())} onClick={() => { setModels([...draft.models, { name: manualName.trim(), capability: manualCapability }]); setManualName(""); }}>
+                <Select aria-label={t("config.channelEditor.capability")} value={manualCapability} options={capabilityOptions} onChange={(capability) => { setManualCapability(capability); setManualProtocol("auto"); }} style={{ width: 100 }} />
+                <Select aria-label={t("config.channelEditor.modelProtocol")} value={manualProtocol} options={protocolOptions(manualCapability)} onChange={setManualProtocol} style={{ width: 200 }} />
+                <Button disabled={!manualName.trim() || draft.models.some((model) => model.name === manualName.trim())} onClick={() => { setModels([...draft.models, { name: manualName.trim(), capability: manualCapability, protocol: manualProtocol }]); setManualName(""); }}>
                     {t("config.modelSelect.add")}
                 </Button>
             </div>
+            {protocolHint(manualCapability, manualProtocol) && <p className="mb-3 text-xs text-stone-500">{protocolHint(manualCapability, manualProtocol)}</p>}
             <p className="mb-3 text-xs text-stone-500">{t("config.modelSelect.description")}</p>
             <div className="space-y-2 rounded-lg border border-stone-200 p-2 dark:border-stone-800">
                 {draft.models.length ? (
-                    draft.models.map((model) => (
-                        <div key={model.name} className="flex flex-wrap items-center gap-3 rounded-md px-2 py-1.5 hover:bg-stone-50 dark:hover:bg-stone-900/40">
-                            <span className="min-w-0 flex-1 truncate text-sm" title={model.name}>
-                                {model.name}
-                            </span>
-                            <div className="flex shrink-0 items-center gap-2">
-                                <Segmented size="small" value={model.capability} options={capabilityOptions} onChange={(value) => setCapability(model.name, value as ModelCapability)} />
-                                <Button size="small" type={model.script ? "primary" : "default"} ghost={Boolean(model.script)} onClick={() => setScriptTarget({ name: model.name, capability: model.capability, value: model.script || "" })}>
-                                    {t(model.script ? "config.channelEditor.scriptReady" : "config.channelEditor.script")}
-                                </Button>
-                                <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => removeModel(model.name)} />
+                    draft.models.map((model) => {
+                        const protocol = normalizeModelProtocol(model.protocol, model.capability);
+                        const hasScript = Boolean(model.script?.trim());
+                        const scriptIgnored = hasScript && protocol !== "auto" && protocol !== "custom-script";
+                        const error = modelProtocolError(model);
+                        return (
+                            <div key={model.name} className="flex flex-wrap items-center gap-3 rounded-md px-2 py-1.5 hover:bg-stone-50 dark:hover:bg-stone-900/40">
+                                <span className="min-w-0 flex-1 truncate text-sm" title={model.name}>
+                                    {model.name}
+                                </span>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <Segmented size="small" aria-label={t("config.channelEditor.capability")} value={model.capability} options={capabilityOptions} onChange={(value) => setCapability(model.name, value as ModelCapability)} />
+                                    <Select size="small" aria-label={t("config.channelEditor.modelProtocol")} value={protocol} options={protocolOptions(model.capability)} onChange={(protocol) => setProtocol(model.name, protocol)} style={{ width: 200 }} />
+                                    <Button size="small" type={hasScript && !scriptIgnored ? "primary" : "default"} ghost={hasScript && !scriptIgnored} onClick={() => setScriptTarget({ name: model.name, capability: model.capability, value: model.script || "" })}>
+                                        {t(scriptIgnored ? "config.channelEditor.scriptInactive" : hasScript ? "config.channelEditor.scriptReady" : "config.channelEditor.script")}
+                                    </Button>
+                                    <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => removeModel(model.name)} />
+                                </div>
+                                <p className="w-full text-xs text-stone-500">{protocolHint(model.capability, protocol)}</p>
+                                {scriptIgnored && <p className="w-full text-xs text-stone-500">{t("config.channelEditor.scriptIgnoredHint")}</p>}
+                                {error && <p role="alert" className="w-full text-xs">{t(`config.channelEditor.${error}`, { model: model.name })}</p>}
                             </div>
-                        </div>
-                    ))
+                        );
+                    })
                 ) : (
                     <div className="px-2 py-8 text-center text-sm text-stone-500">{t("config.channelEditor.empty")}</div>
                 )}

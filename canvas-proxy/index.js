@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
+import { createRequestLog, ERROR_SAMPLE_BYTES, readRuntime, redact, safeError, safeTarget, sampledError } from "./request-log.js";
 
 const pkg = createRequire(import.meta.url)("./package.json");
 
@@ -29,6 +30,7 @@ function readBody(req) {
         req.on("data", (chunk) => chunks.push(chunk));
         req.on("end", () => resolve(Buffer.concat(chunks)));
         req.on("error", reject);
+        req.on("aborted", () => reject(Object.assign(new Error("客户端取消请求"), { code: "CLIENT_ABORTED" })));
     });
 }
 
@@ -70,27 +72,142 @@ function sendJson(res, status, payload) {
 }
 
 function logForward(method, target, outcome, startedAt) {
-    console.log(`${new Date().toLocaleTimeString()} ${method} ${target} -> ${outcome} ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+    try {
+        console.log(`${new Date().toLocaleTimeString()} ${method} ${safeTarget(target)} -> ${redact(outcome)} ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+    } catch {
+        // 控制台日志失败不影响转发。
+    }
 }
 
-async function forward(req, res, target) {
-    const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
-    const upstream = await fetch(target, { method: req.method, headers: requestHeaders(req), body, redirect: "follow" });
-    // Logged as soon as the status line arrives, so a long SSE stream still shows up immediately.
-    res.writeHead(upstream.status, responseHeaders(upstream));
-    if (!upstream.body) {
-        res.end();
-        return upstream.status;
+async function forward(req, res, target, log) {
+    const startedAt = Date.now();
+    const record = log.start(req.method || "GET", target);
+    const controller = new AbortController();
+    let stream;
+    let sampler;
+    let sample = Buffer.alloc(0);
+    let settled = false;
+    const finish = (state, error) => {
+        if (settled) return;
+        settled = true;
+        record.state = state;
+        record.durationMs = Date.now() - startedAt;
+        record.endedAt = new Date().toISOString();
+        if (error) record.error = safeError(error);
+        else if (record.status >= 400) record.error = sampledError(sample, record.status);
+        log.save(record);
+        req.off("aborted", cancel);
+        res.off("close", onClose);
+        res.off("finish", onFinish);
+        logForward(record.method, target, `${record.status ?? "-"} ${state}`, startedAt);
+    };
+    const cancel = () => {
+        finish("cancelled", { code: "CLIENT_ABORTED", message: "客户端取消请求" });
+        controller.abort();
+        stream?.destroy();
+        sampler?.destroy();
+    };
+    const onClose = () => {
+        if (!res.writableFinished) cancel();
+    };
+    const onFinish = () => finish(record.status >= 400 ? "error" : "success");
+    req.once("aborted", cancel);
+    res.once("close", onClose);
+    res.once("finish", onFinish);
+    try {
+        const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
+        if (settled || req.aborted || res.destroyed) {
+            cancel();
+            return;
+        }
+        if (body) {
+            try {
+                const model = JSON.parse(body.toString("utf8"))?.model;
+                if (typeof model === "string") record.model = redact(model, 128);
+            } catch {}
+        }
+        const upstream = await fetch(target, { method: req.method, headers: requestHeaders(req), body, redirect: "follow", signal: controller.signal });
+        if (settled) {
+            await upstream.body?.cancel();
+            return;
+        }
+        record.status = upstream.status;
+        record.headersAt = new Date().toISOString();
+        record.durationMs = Date.now() - startedAt;
+        record.state = "streaming";
+        if (upstream.status >= 400) record.error = sampledError(sample, upstream.status);
+        log.save(record);
+        logForward(record.method, target, `${upstream.status} headers`, startedAt);
+        res.writeHead(upstream.status, responseHeaders(upstream));
+        res.flushHeaders();
+        if (!upstream.body) {
+            res.end();
+            return;
+        }
+        stream = Readable.fromWeb(upstream.body);
+        const failed = (error) => {
+            if (settled) return;
+            finish("error", error);
+            controller.abort();
+            stream.destroy();
+            sampler?.destroy();
+            res.destroy();
+        };
+        // 先记录上游错误再关闭客户端连接，避免将断流误记为客户端取消。
+        stream.once("error", failed);
+        res.once("error", failed);
+        if (upstream.status >= 400) {
+            sampler = new Transform({
+                transform(chunk, encoding, callback) {
+                    const remaining = ERROR_SAMPLE_BYTES - sample.length;
+                    if (remaining > 0) sample = Buffer.concat([sample, chunk.subarray(0, remaining)]);
+                    callback(null, chunk);
+                },
+            });
+            sampler.once("error", failed);
+            stream.pipe(sampler).pipe(res);
+        } else {
+            // SSE 不等待完整响应，保留 Node stream 的逐块转发和背压。
+            stream.pipe(res);
+        }
+    } catch (error) {
+        if (settled) return;
+        finish("error", error);
+        controller.abort();
+        if (res.headersSent) res.destroy();
+        else sendJson(res, 502, { error: safeError(error).message });
     }
-    // Streamed so that SSE responses (text generation) reach the browser chunk by chunk.
-    const stream = Readable.fromWeb(upstream.body);
-    res.on("close", () => stream.destroy());
-    stream.pipe(res);
-    return upstream.status;
+}
+
+function sendLogJson(res, status, payload) {
+    res.writeHead(status, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+        ...(status === 405 ? { allow: "GET" } : {}),
+    });
+    res.end(JSON.stringify(payload));
 }
 
 export function createProxyServer() {
+    const log = createRequestLog();
     return createServer((req, res) => {
+        const path = (req.url || "/").split("?", 1)[0];
+        if (path === "/__logs" || path === "/__runtime") {
+            if (req.method !== "GET") {
+                sendLogJson(res, 405, { error: "只允许 GET" });
+                return;
+            }
+            const result = path === "/__logs"
+                ? log.query(new URL(req.url, "http://localhost").searchParams)
+                : readRuntime();
+            result.then((payload) => {
+                if (!res.destroyed) sendLogJson(res, 200, payload);
+            }).catch((error) => {
+                if (!res.destroyed) sendLogJson(res, 500, { error: safeError(error) });
+            });
+            return;
+        }
         if (req.method === "OPTIONS") {
             res.writeHead(204, CORS_HEADERS);
             res.end();
@@ -101,19 +218,10 @@ export function createProxyServer() {
             sendJson(res, 200, { app: "infinite-canvas", proxy: pkg.name, version: pkg.version, usage: "/<full-target-url>" });
             return;
         }
-        const startedAt = Date.now();
-        const method = req.method || "GET";
-        forward(req, res, target)
-            .then((status) => logForward(method, target, status, startedAt))
-            .catch((error) => {
-                const reason = error instanceof Error ? error.message : String(error);
-                logForward(method, target, `failed (${reason})`, startedAt);
-                if (res.headersSent) {
-                    res.destroy();
-                    return;
-                }
-                sendJson(res, 502, { error: reason });
-            });
+        forward(req, res, target, log).catch(() => {
+            if (res.headersSent) res.destroy();
+            else sendJson(res, 502, { error: "代理请求失败" });
+        });
     });
 }
 

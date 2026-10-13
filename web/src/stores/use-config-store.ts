@@ -4,14 +4,16 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { normalizeModelProtocol, resolveModelProtocolExecution, type ApiCallFormat, type ModelCapability, type ModelProtocol } from "@/lib/model-protocol";
 
-export type ApiCallFormat = "openai" | "openai-chat" | "gemini";
-export type ModelCapability = "image" | "video" | "text" | "audio";
+export { MODEL_PROTOCOLS, MODEL_PROTOCOLS_BY_CAPABILITY, normalizeModelProtocol, modelProtocolError, resolveModelProtocolExecution } from "@/lib/model-protocol";
+export type { ApiCallFormat, ModelCapability, ModelProtocol } from "@/lib/model-protocol";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
 
 export type ChannelModel = {
     name: string;
     capability: ModelCapability;
+    protocol?: ModelProtocol;
     script?: string;
 };
 
@@ -30,6 +32,7 @@ export type AiConfig = {
     apiKey: string;
     apiFormat: ApiCallFormat;
     channels: ModelChannel[];
+    modelProtocol?: ModelProtocol;
     model: string;
     imageModel: string;
     videoModel: string;
@@ -202,9 +205,18 @@ export function selectableModelsByCapability(config: AiConfig, capability?: Mode
     return config.channels.flatMap((channel) => channel.models.filter((model) => model.capability === capability).map((model) => encodeChannelModel(channel.id, model.name)));
 }
 
-/** The user script (if any) attached to a model; empty string means use the system default call. */
+function resolveSelectedModelExecution(config: AiConfig, value: string) {
+    const selectedModel = value || config.model;
+    const channel = resolveModelChannel(config, selectedModel);
+    const model = findChannelModel(config, selectedModel)?.model || { capability: guessCapability(modelOptionName(selectedModel)) };
+    const execution = resolveModelProtocolExecution(model, channel.apiFormat);
+    if (execution.error) throw new Error(i18n.t(`config.channelEditor.${execution.error}`, { model: modelOptionName(selectedModel) }));
+    return { selectedModel, channel, execution };
+}
+
+/** 返回所选模型实际使用的脚本；显式内置协议忽略旧脚本。 */
 export function resolveModelScript(config: AiConfig, value: string) {
-    return findChannelModel(config, value)?.model.script?.trim() || "";
+    return resolveSelectedModelExecution(config, value).execution.script;
 }
 
 function isAiConfigReady(config: AiConfig, model: string) {
@@ -306,7 +318,8 @@ export function normalizeChannelModels(models: Array<string | ChannelModel> | un
         seen.add(name);
         const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
         const script = typeof item === "string" ? undefined : item.script?.trim() || undefined;
-        result.push({ name, capability, script });
+        const protocol = normalizeModelProtocol(typeof item === "string" ? undefined : item.protocol, capability);
+        result.push({ name, capability, protocol, script });
     }
     return result;
 }
@@ -436,13 +449,14 @@ export function resolveModelChannel(config: AiConfig, value: string) {
 }
 
 export function resolveModelRequestConfig(config: AiConfig, value: string) {
-    const channel = resolveModelChannel(config, value);
+    const { selectedModel, channel, execution } = resolveSelectedModelExecution(config, value);
     return {
         ...config,
-        model: modelOptionName(value || config.model),
+        model: modelOptionName(selectedModel),
+        modelProtocol: execution.protocol,
         baseUrl: channel.baseUrl,
         apiKey: channel.apiKey,
-        apiFormat: channel.apiFormat,
+        apiFormat: execution.apiFormat,
     };
 }
 
@@ -487,7 +501,8 @@ function uniqueModelOptions(models: string[]) {
 export function buildApiUrl(baseUrl: string, path: string) {
     const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
     const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
-    const apiBaseUrl = lowerBaseUrl.endsWith("/v1") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
+    // Preserve an explicit API version (for example Ark /api/v3), not only /v1.
+    const apiBaseUrl = /\/v\d+(?:beta\d*)?$/.test(lowerBaseUrl) ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
     return withLocalProxy(`${apiBaseUrl}${path}`);
 }
 

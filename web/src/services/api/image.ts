@@ -9,6 +9,8 @@ import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { imageToDataUrl } from "@/services/image-storage";
 import { imageSizePresets, inferMediaScale } from "@/lib/media-size";
 import type { ReferenceImage } from "@/types/image";
+import { requestImageAdapter } from "./adapters/image-adapter";
+import type { ImageAdapterContext } from "./adapters/image-types";
 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
@@ -73,12 +75,6 @@ type ResponseStreamState = { buffer: string; text: string; payload?: ResponseApi
 type ChatStreamState = { buffer: string; text: string; error?: string };
 type ChatCompletionMessagePart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
 
-type ImageApiResponse = {
-    data?: Array<Record<string, unknown>>;
-    error?: { message?: string };
-    code?: number;
-    msg?: string;
-};
 type GeminiPart = {
     text?: string;
     inlineData?: { mimeType?: string; data?: string };
@@ -106,9 +102,6 @@ const IMAGE_MIN_PIXELS = 655360;
 const IMAGE_MAX_PIXELS = 8294400;
 const IMAGE_MAX_EDGE = 3840;
 const IMAGE_MAX_RATIO = 3;
-const IMAGE_OUTPUT_FORMAT = "png";
-// 与 image-storage 的下载超时保持一致，避免接口挂起时节点一直停在生成中。
-const IMAGE_REQUEST_TIMEOUT_MS = 10 * 60_000;
 
 const GEMINI_SUPPORTED_RATIOS = ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"];
 
@@ -212,41 +205,6 @@ function resolveGeminiImageSize(dimensions: { width: number; height: number } | 
     return "4K";
 }
 
-function resolveImageSource(item: Record<string, unknown>) {
-    if (typeof item.b64_json === "string" && item.b64_json) {
-        return `data:image/png;base64,${item.b64_json}`;
-    }
-    if (typeof item.url === "string" && item.url) {
-        return item.url;
-    }
-    return null;
-}
-
-function parseImagePayload(payload: ImageApiResponse) {
-    if (typeof payload.code === "number" && payload.code !== 0) {
-        throw new Error(payload.msg || apiText("requestFailed"));
-    }
-    // Support data, images, and results response fields used by different APIs.
-    const imageList = payload.data
-        || (payload as Record<string, unknown>).images as Array<Record<string, unknown>> | undefined
-        || (payload as Record<string, unknown>).results as Array<Record<string, unknown>> | undefined
-        || [];
-    const images = imageList
-        .map(resolveImageSource)
-        .filter((value): value is string => Boolean(value))
-        .map((dataUrl) => ({ id: nanoid(), dataUrl }));
-
-    if (images.length === 0) {
-        // Check whether the response contains data in an unrecognized format.
-        const rawKeys = Object.keys(payload).filter((k) => k !== "code" && k !== "msg" && k !== "error");
-        throw new Error(rawKeys.length > 0
-            ? apiText("unknownImageResponse", { fields: rawKeys.join(", ") })
-            : apiText("noImageReturned"));
-    }
-
-    return images;
-}
-
 function readApiErrorMessage(value: unknown): string {
     if (!value) return "";
     if (typeof value === "string") {
@@ -264,19 +222,19 @@ function readApiErrorMessage(value: unknown): string {
         }
     }
     if (typeof value !== "object") return "";
-    const payload = value as { msg?: unknown; message?: unknown; error?: unknown; detail?: unknown };
+    const payload = value as { msg?: unknown; message?: unknown; error?: unknown; detail?: unknown; code?: unknown; traceId?: unknown; trace_id?: unknown };
     // error may be a string or an object containing a message.
     const errorMsg =
         typeof payload.error === "string"
             ? payload.error
             : (payload.error as { message?: unknown })?.message;
-    return (
-        readApiErrorMessage(payload.msg) ||
-        readApiErrorMessage(payload.message) ||
-        readApiErrorMessage(errorMsg) ||
-        readApiErrorMessage(payload.detail) ||
-        ""
-    );
+    const message = readApiErrorMessage(payload.msg) || readApiErrorMessage(payload.message) || readApiErrorMessage(errorMsg) || readApiErrorMessage(payload.detail);
+    if (!message) return "";
+    const nested = payload.error && typeof payload.error === "object" ? payload.error as Record<string, unknown> : {};
+    const code = payload.code ?? nested.code;
+    const trace = payload.traceId ?? payload.trace_id ?? nested.traceId ?? nested.trace_id;
+    const suffix = [typeof code === "string" ? code : "", typeof trace === "string" ? `traceId: ${trace}` : ""].filter(Boolean).join(" · ");
+    return suffix ? `${message} (${suffix})` : message;
 }
 
 function readAxiosError(error: unknown, fallback: string) {
@@ -402,7 +360,8 @@ function responseErrorMessage(value: unknown) {
     const error = isRecord(value.error) ? value.error : undefined;
     const response = isRecord(value.response) ? value.response : undefined;
     const responseError = response && isRecord(response.error) ? response.error : undefined;
-    return stringValue(value.msg) || stringValue(error?.message) || stringValue(responseError?.message);
+    if (error || responseError || value.msg || (value.code && value.message)) return readApiErrorMessage(responseError || value);
+    return "";
 }
 
 function stringValue(value: unknown) {
@@ -503,7 +462,7 @@ async function requestStreamingResponse(config: AiConfig, body: Record<string, u
 }
 
 function toChatMessages(messages: ResponseInputMessage[]): Array<{ role: string; content: string | ChatCompletionMessagePart[] }> {
-    return messages.flatMap((message) => {
+    return messages.flatMap<{ role: string; content: string | ChatCompletionMessagePart[] }>((message) => {
         if ("type" in message || message.role === "tool") return [];
         if (!Array.isArray(message.content)) return [{ role: message.role, content: String(message.content || "") }];
         const parts: ChatCompletionMessagePart[] = message.content.map((item) => (item.type === "text" ? { type: "text", text: item.text } : { type: "image_url", image_url: { url: item.image_url.url } }));
@@ -745,41 +704,25 @@ function parseGeminiToolResponse(payload: GeminiPayload): ToolResponseResult {
     return { content, toolCalls };
 }
 
-async function requestGeminiImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
-    const requests = Array.from({ length: count }, () => requestGeminiImagesOnce(config, prompt, references, options));
-    return (await Promise.all(requests)).flat();
-}
+const imageAdapterHelpers: ImageAdapterContext["helpers"] = {
+    apiUrl: aiApiUrl,
+    headers: aiHeaders,
+    systemPrompt: withSystemPrompt,
+    quality: normalizeQuality,
+    size: resolveRequestSize,
+    background: normalizeBackground,
+    geminiUrl: geminiApiUrl,
+    geminiHeaders,
+    geminiImageConfig: resolveGeminiImageConfig,
+    imageToDataUrl,
+    dataUrlToFile,
+    apiText,
+    readError: readApiErrorMessage,
+    id: nanoid,
+};
 
-async function requestGeminiImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
-    const parts: GeminiPart[] = [{ text: prompt }];
-    for (const image of references) {
-        parts.push(toGeminiImagePart(await imageToDataUrl(image)));
-    }
-    const response = await axios.post<GeminiPayload>(
-        geminiApiUrl(config, "generateContent"),
-        {
-            ...toGeminiBody(config, [{ role: "user", content: prompt }], { generationConfig: { responseModalities: ["TEXT", "IMAGE"], ...resolveGeminiImageConfig(config) } }),
-            contents: [{ role: "user", parts }],
-        },
-        { headers: geminiHeaders(config), signal: options?.signal, timeout: IMAGE_REQUEST_TIMEOUT_MS },
-    );
-    return parseGeminiImagePayload(response.data);
-}
-
-function parseGeminiImagePayload(payload: GeminiPayload) {
-    validateGeminiPayload(payload);
-    const images =
-        payload.candidates
-            ?.flatMap((candidate) => candidate.content?.parts || [])
-            .map((part) => {
-                const inlineData = part.inlineData || (part.inline_data ? { mimeType: part.inline_data.mimeType || part.inline_data.mime_type, data: part.inline_data.data } : undefined);
-                if (inlineData?.data) return `data:${inlineData.mimeType || "image/png"};base64,${inlineData.data}`;
-                return part.fileData?.fileUri || null;
-            })
-            .filter((value): value is string => Boolean(value))
-            .map((dataUrl) => ({ id: nanoid(), dataUrl })) || [];
-    if (!images.length) throw new Error(apiText("geminiNoImage"));
-    return images;
+function imageAdapterContext(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, editing: boolean, options?: RequestOptions): ImageAdapterContext {
+    return { config, prompt, references, count, editing, options, helpers: imageAdapterHelpers };
 }
 
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
@@ -805,38 +748,8 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
-    if (requestConfig.apiFormat === "gemini") {
-        try {
-            return await requestGeminiImages(requestConfig, prompt, [], n, options);
-        } catch (error) {
-            throw new Error(readAxiosError(error, apiText("requestFailed")));
-        }
-    }
-    const quality = normalizeQuality(config.quality);
-    const requestSize = resolveRequestSize(config.size);
-    const background = normalizeBackground(config.background);
     try {
-        const response = await axios.post<ImageApiResponse>(
-            aiApiUrl(requestConfig, "/images/generations"),
-            {
-                model: requestConfig.model,
-                prompt: withSystemPrompt(requestConfig, prompt),
-                n,
-                ...(quality ? { quality } : {}),
-                ...(requestSize ? { size: requestSize } : {}),
-                ...(background ? { background } : {}),
-                // gpt-image models reject response_format; they always return b64.
-                ...(/gpt-image/.test(requestConfig.model) ? {} : { response_format: "b64_json" }),
-                output_format: IMAGE_OUTPUT_FORMAT,
-            },
-            {
-                headers: aiHeaders(requestConfig, "application/json"),
-                signal: options?.signal,
-                timeout: IMAGE_REQUEST_TIMEOUT_MS,
-            },
-        );
-        const images = await parseImagePayload(response.data);
-        return images;
+        return await requestImageAdapter(imageAdapterContext(requestConfig, prompt, [], n, false, options));
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("requestFailed")));
     }
@@ -867,43 +780,8 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
-    if (requestConfig.apiFormat === "gemini") {
-        try {
-            return await requestGeminiImages(requestConfig, requestPrompt, references, n, options);
-        } catch (error) {
-            throw new Error(readAxiosError(error, apiText("requestFailed")));
-        }
-    }
-
-    const quality = normalizeQuality(config.quality);
-    const requestSize = resolveRequestSize(config.size);
-    const background = normalizeBackground(config.background);
-    const formData = new FormData();
-    formData.set("model", requestConfig.model);
-    formData.set("prompt", withSystemPrompt(requestConfig, requestPrompt));
-    formData.set("n", String(n));
-    // gpt-image models reject response_format; they always return b64.
-    if (!/gpt-image/.test(requestConfig.model)) {
-        formData.set("response_format", "b64_json");
-    }
-    formData.set("output_format", IMAGE_OUTPUT_FORMAT);
-    if (quality) {
-        formData.set("quality", quality);
-    }
-    if (requestSize) {
-        formData.set("size", requestSize);
-    }
-    if (background) {
-        formData.set("background", background);
-    }
-    const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
-    const imageField = files.length > 1 ? "image[]" : "image";
-    files.forEach((file) => formData.append(imageField, file));
-
     try {
-        const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), formData, { headers: aiHeaders(requestConfig), signal: options?.signal, timeout: IMAGE_REQUEST_TIMEOUT_MS });
-        const images = await parseImagePayload(response.data);
-        return images;
+        return await requestImageAdapter(imageAdapterContext(requestConfig, requestPrompt, references, n, true, options));
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("requestFailed")));
     }

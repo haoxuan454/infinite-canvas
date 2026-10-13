@@ -18,3 +18,10 @@ web/public/pluginsweb/src.bak-*/
 .git_bak/
 web/src.bak-*/
 web/backups/
+
+# 本地备份与日志（不提交）
+backups/
+logs/
+web/backups/
+*.log
+*.jsonl
