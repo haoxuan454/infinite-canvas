@@ -1,7 +1,6 @@
 import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FolderPlus, History, ImagePlus, LoaderCircle, PenLine, Plus, SlidersHorizontal, Sparkles, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { App, Button, Checkbox, Drawer, Empty, Image, Input, Modal, Tag, Tooltip, Typography } from "antd";
-import localforage from "localforage";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
@@ -15,57 +14,15 @@ import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } f
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
-import { requestEdit, requestGeneration } from "@/services/api/image";
-import { deleteStoredImages, ensureImagePreview, getImagePreviewRevision, previewUrlFor, resolveImageUrl, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
+import { imageHistory, imageWorkbench, initializeImageWorkbench, submitImageTask, type GeneratedImage, type GenerationLog } from "@/services/image-workbench";
+import { getImagePreviewRevision, previewUrlFor, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import type { ReferenceImage } from "@/types/image";
-import i18n from "@/i18n";
-
-type GeneratedImage = {
-    id: string;
-    dataUrl: string;
-    storageKey?: string;
-    durationMs: number;
-    width: number;
-    height: number;
-    bytes: number;
-    mimeType?: string;
-};
-
-type GenerationResult = {
-    id: string;
-    status: "pending" | "success" | "failed";
-    image?: GeneratedImage;
-    error?: string;
-};
-
-type GenerationLog = {
-    id: string;
-    createdAt: number;
-    title: string;
-    prompt: string;
-    time: string;
-    model: string;
-    config: GenerationLogConfig;
-    references: ReferenceImage[];
-    durationMs: number;
-    successCount: number;
-    failCount: number;
-    imageCount: number;
-    size: string;
-    quality: string;
-    status: "success" | "failed";
-    images: GeneratedImage[];
-};
-
-type GenerationLogConfig = Pick<AiConfig, "model" | "imageModel" | "quality" | "size" | "count">;
 
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
 
-const LOG_STORE_KEY = "infinite-canvas:image_generation_logs";
 const RESULT_ACTION_BUTTON_CLASS = "min-w-0 px-1.5 [&_.ant-btn-icon]:shrink-0 [&>span:last-child]:min-w-0 [&>span:last-child]:truncate";
-const logStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_logs" });
 
 export default function ImagePage() {
     const { message } = App.useApp();
@@ -81,17 +38,18 @@ export default function ImagePage() {
     const addAsset = useAssetStore((state) => state.addAsset);
     const [prompt, setPrompt] = useState("");
     const [references, setReferences] = useState<ReferenceImage[]>([]);
-    const [results, setResults] = useState<GenerationResult[]>([]);
-    const [logs, setLogs] = useState<GenerationLog[]>([]);
-    const [running, setRunning] = useState(false);
+    const logs = useSyncExternalStore(imageHistory.subscribe, imageHistory.getSnapshot);
+    const taskState = useSyncExternalStore(imageWorkbench.subscribe, imageWorkbench.getSnapshot);
+    const previewLog = logs.find((log) => log.id === taskState.selectedId) || null;
+    const results = previewLog?.slots || [];
+    const running = Boolean(taskState.activeId);
     const [logsOpen, setLogsOpen] = useState(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
-    const [startedAt, setStartedAt] = useState(0);
+    const startedAt = taskState.startedAt;
     const [elapsedMs, setElapsedMs] = useState(0);
     const [selectedLogIds, setSelectedLogIds] = useState<string[]>([]);
-    const [previewLog, setPreviewLog] = useState<GenerationLog | null>(null);
     const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
     const [isReferenceDragActive, setIsReferenceDragActive] = useState(false);
     const [autoRunToken, setAutoRunToken] = useState(0);
@@ -107,26 +65,46 @@ export default function ImagePage() {
 
     useEffect(() => {
         if (!running || !startedAt) return;
+        setElapsedMs(performance.now() - startedAt);
         const timer = window.setInterval(() => setElapsedMs(performance.now() - startedAt), 1000);
         return () => window.clearInterval(timer);
     }, [running, startedAt]);
 
     useEffect(() => {
-        void refreshLogs();
-    }, []);
+        void initializeImageWorkbench().catch(() => message.error("图片任务历史读取或保存失败，请勿自动重试生成。"));
+    }, [message]);
+
+    useEffect(() => {
+        if (!previewLog) return;
+        setPrompt(previewLog.prompt);
+        setReferences(previewLog.references);
+        // 活跃任务只恢复输入，不回写参数；slot 更新不覆盖用户编辑。
+        if (taskState.activeId === previewLog.id) return;
+        if (previewLog.config.imageModel || previewLog.model) updateConfig("imageModel", previewLog.config.imageModel || previewLog.model);
+        if (previewLog.config.quality) updateConfig("quality", previewLog.config.quality);
+        if (previewLog.config.size) updateConfig("size", previewLog.config.size);
+        if (previewLog.config.count) updateConfig("count", previewLog.config.count);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [previewLog?.id]);
 
     const addReferences = async (files?: FileList | null) => {
-        const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
-        const nextReferences = await Promise.all(
-            imageFiles.map(async (file) => {
-                const image = await uploadImage(file);
-                return { id: nanoid(), name: file.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
-            }),
-        );
-        setReferences((value) => [...value, ...nextReferences]);
+        try {
+            const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
+            const nextReferences = await Promise.all(
+                imageFiles.map(async (file) => {
+                    const image = await uploadImage(file);
+                    if (!image.storageKey) throw new Error("参考图未保存到本地");
+                    return { id: nanoid(), name: file.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
+                }),
+            );
+            setReferences((value) => [...value, ...nextReferences]);
+        } catch {
+            message.error("参考图上传或保存失败，本批未添加；请检查本地存储后手动重试。");
+        }
     };
 
     const addReferencesFromClipboard = async () => {
+        let saving = false;
         try {
             const items = await navigator.clipboard.read();
             const blobs = await Promise.all(items.flatMap((item) => item.types.filter((type) => type.startsWith("image/")).map((type) => item.getType(type))));
@@ -134,16 +112,18 @@ export default function ImagePage() {
                 message.error(t("imageWorkbench.clipboardEmpty"));
                 return;
             }
+            saving = true;
             const nextReferences = await Promise.all(
                 blobs.map(async (blob, index) => {
                     const image = await uploadImage(blob);
+                    if (!image.storageKey) throw new Error("参考图未保存到本地");
                     return { id: nanoid(), name: `clipboard-${index + 1}.png`, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
                 }),
             );
             setReferences((value) => [...value, ...nextReferences]);
             message.success(t("imageWorkbench.clipboardAdded", { count: nextReferences.length }));
         } catch {
-            message.error(t("imageWorkbench.clipboardEmpty"));
+            message.error(saving ? "剪贴板参考图保存失败，本批未添加；请检查本地存储后手动重试。" : "剪贴板图片读取失败，请检查读取权限或改用上传。");
         }
     };
 
@@ -170,44 +150,16 @@ export default function ImagePage() {
         }
 
         setElapsedMs(0);
-        setRunning(true);
-        if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
-        setPreviewLog(null);
-        setResults(Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" })));
-        const batchStartedAt = performance.now();
-        setStartedAt(batchStartedAt);
-
-        const tasks = Array.from({ length: generationCount }, (_, index) => runGenerationSlot(index, snapshot));
-
-        const result = await Promise.allSettled(tasks);
-        const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
-        const successCount = successImages.length;
-        const failCount = generationCount - successCount;
-        const failed = result.find((item): item is PromiseRejectedResult => item.status === "rejected");
-        const error = failed?.reason instanceof Error ? failed.reason.message : failCount ? t("workbench.generationFailed") : undefined;
-        if (agentTaskId) updateAgentTask(agentTaskId, { status: successCount ? "succeeded" : "failed", successCount, failCount, error: successCount ? undefined : error });
-
         try {
-            saveLog(
-                buildLog({
-                    prompt: text,
-                    model,
-                    config: { ...snapshot.config, count: String(generationCount) },
-                    references: snapshot.references,
-                    durationMs: performance.now() - batchStartedAt,
-                    successCount,
-                    failCount,
-                    status: successCount ? "success" : "failed",
-                    images: successImages,
-                }),
-            );
-            successCount ? message.success(t("imageWorkbench.generated")) : message.error(failed?.reason instanceof Error ? failed.reason.message : t("workbench.generationFailed"));
-        } finally {
-            setRunning(false);
+            await submitImageTask(snapshot, generationCount, { agentTaskId });
+        } catch (error) {
+            const text = error instanceof Error ? error.message : "图片任务提交失败，未自动重试。";
+            message.error(text);
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: text });
         }
     };
 
-    // Handle image-generation commands from the Agent panel by setting the prompt and optionally starting generation.
+    // 接收 Agent 图片指令，设置提示词并按需提交任务。
     useEffect(() => {
         if (!imageCommand || imageCommand.nonce === processedCommandRef.current) return;
         processedCommandRef.current = imageCommand.nonce;
@@ -234,74 +186,82 @@ export default function ImagePage() {
     };
 
     const addResultToReferences = async (image: GeneratedImage, index: number) => {
-        const stored = await uploadImage(image.dataUrl);
-        setReferences((value) => [...value, { id: nanoid(), name: `result-${index + 1}.png`, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
-        message.success(t("imageWorkbench.addedReference"));
+        try {
+            if (!image.dataUrl) throw new Error("图片媒体不可用");
+            const stored = await uploadImage(image.dataUrl);
+            if (!stored.storageKey) throw new Error("参考图未保存到本地");
+            setReferences((value) => [...value, { id: nanoid(), name: `result-${index + 1}.png`, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
+            message.success(t("imageWorkbench.addedReference"));
+        } catch {
+            message.error("结果添加为参考图失败，原生成结果仍保留；请检查媒体或本地存储后手动重试。");
+        }
     };
 
     const saveResultToAssets = async (image: GeneratedImage, index: number) => {
-        const stored = await uploadImage(image.dataUrl);
-        addAsset({
-            kind: "image",
-            title: t("imageWorkbench.resultTitle", { count: index + 1 }),
-            coverUrl: stored.url,
-            tags: [],
-            source: t("imageWorkbench.source"),
-            data: { dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType },
-            metadata: { source: "image-page", prompt },
-        });
-        message.success(t("common.addedToAssets"));
+        try {
+            if (!image.dataUrl) throw new Error("图片媒体不可用");
+            const stored = await uploadImage(image.dataUrl);
+            if (!stored.storageKey) throw new Error("媒体未保存到本地");
+            await addAsset({
+                kind: "image",
+                title: t("imageWorkbench.resultTitle", { count: index + 1 }),
+                coverUrl: stored.url,
+                tags: [],
+                source: t("imageWorkbench.source"),
+                data: { dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType },
+                metadata: { source: "image-page", prompt },
+            });
+            message.success(t("common.addedToAssets"));
+        } catch {
+            message.error("手动保存资产失败，原生成结果仍保留；请检查媒体或本地存储，不会自动补录或重新生成。");
+        }
     };
 
     const insertPickedAsset = async (payload: InsertAssetPayload) => {
-        if (payload.kind === "text") {
-            setPrompt(payload.content);
-        } else if (payload.kind === "image") {
-            const stored = await uploadImage(payload.dataUrl);
-            setReferences((value) => [...value, { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
-        } else {
-            message.warning(t("imageWorkbench.unsupportedAsset"));
+        try {
+            if (payload.kind === "text") {
+                setPrompt(payload.content);
+            } else if (payload.kind === "image") {
+                if (!payload.dataUrl) throw new Error("资产媒体不可用");
+                const stored = await uploadImage(payload.dataUrl);
+                if (!stored.storageKey) throw new Error("参考图未保存到本地");
+                setReferences((value) => [...value, { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
+            } else {
+                message.warning(t("imageWorkbench.unsupportedAsset"));
+            }
+            setAssetPickerOpen(false);
+        } catch {
+            message.error("资产图片添加为参考图失败，请检查媒体或本地存储后手动重试。");
         }
-        setAssetPickerOpen(false);
     };
 
     const createSession = () => {
         setPrompt("");
         setReferences([]);
-        setResults([]);
         setElapsedMs(0);
-        setStartedAt(0);
         setSelectedLogIds([]);
-        setPreviewLog(null);
+        imageWorkbench.select(undefined);
     };
 
-    const deleteSelectedLogs = () => {
-        const imageKeys = logs.filter((log) => selectedLogIds.includes(log.id)).flatMap((log) => log.images.map((image) => image.storageKey).filter((key): key is string => Boolean(key)));
-        void Promise.all([deleteStoredImages(imageKeys), ...selectedLogIds.map((id) => logStore.removeItem(id))]).then(refreshLogs);
-        if (previewLog && selectedLogIds.includes(previewLog.id)) {
-            setPreviewLog(null);
-            setResults([]);
+    const deleteSelectedLogs = async () => {
+        if (selectedLogIds.includes(taskState.activeId || "")) {
+            message.warning("生成中的图片任务不能删除历史");
+            return;
         }
-        setSelectedLogIds([]);
-        setDeleteConfirmOpen(false);
+        try {
+            // 此处只删除历史记录，媒体引用安全删除由共享存储负责人处理。
+            await imageHistory.remove(selectedLogIds);
+            if (previewLog && selectedLogIds.includes(previewLog.id)) imageWorkbench.select(undefined);
+            setSelectedLogIds([]);
+            setDeleteConfirmOpen(false);
+        } catch {
+            message.error("图片任务历史删除失败");
+        }
     };
 
-    const saveLog = (log: GenerationLog) => {
-        void logStore.setItem(log.id, serializeLog(log)).then(refreshLogs);
-    };
-
-    const refreshLogs = async () => setLogs(await readStoredLogs());
-
-    const previewGenerationLog = async (log: GenerationLog) => {
-        setPreviewLog(log);
+    const previewGenerationLog = (log: GenerationLog) => {
+        imageWorkbench.select(log.id);
         setLogsOpen(false);
-        setPrompt(log.prompt);
-        setReferences(log.references || []);
-        if (log.config.imageModel || log.model) updateConfig("imageModel", log.config.imageModel || log.model);
-        if (log.config.quality) updateConfig("quality", log.config.quality);
-        if (log.config.size) updateConfig("size", log.config.size);
-        if (log.config.count) updateConfig("count", log.config.count);
-        setResults(log.images.map((image) => ({ id: image.id, status: "success", image })));
     };
 
     const buildRequestSnapshot = () => {
@@ -318,46 +278,20 @@ export default function ImagePage() {
         return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
     };
 
-    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }) => {
-        const itemStartedAt = performance.now();
-        try {
-            const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references) : await requestGeneration(snapshot.config, snapshot.text);
-            const image = result[0];
-            if (!image) throw new Error(t("imageWorkbench.missingResult"));
-            const stored = await uploadImage(image.dataUrl);
-            const nextImage: GeneratedImage = { id: image.id, dataUrl: stored.url, ...(stored.storageKey ? { storageKey: stored.storageKey } : {}), durationMs: performance.now() - itemStartedAt, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType };
-            setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage }));
-            return nextImage;
-        } catch (error) {
-            setResults((value) => updateResultAt(value, index, { status: "failed", error: error instanceof Error ? error.message : t("workbench.generationFailed") }));
-            throw error;
-        }
-    };
-
     const retryResult = async (index: number) => {
+        const original = previewLog;
+        const slot = original?.slots[index];
+        if (!original || !slot || (slot.status !== "failed" && slot.status !== "interrupted")) return;
+        if (imageWorkbench.getSnapshot().activeId) {
+            message.warning(t("imageWorkbench.busy"));
+            return;
+        }
         const snapshot = buildRequestSnapshot();
         if (!snapshot) return;
-        setPreviewLog(null);
-        setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
-        const retryStartedAt = performance.now();
         try {
-            const image = await runGenerationSlot(index, snapshot);
-            saveLog(
-                buildLog({
-                    prompt: snapshot.text,
-                    model,
-                    config: { ...snapshot.config, count: "1" },
-                    references: snapshot.references,
-                    durationMs: performance.now() - retryStartedAt,
-                    successCount: 1,
-                    failCount: 0,
-                    status: "success",
-                    images: [image],
-                }),
-            );
-            message.success(t("workbench.retrySuccess"));
-        } catch {
-            // runGenerationSlot has already marked the result as failed.
+            await submitImageTask(snapshot, 1, { retryOf: { taskId: original.id, slotId: slot.id } });
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "图片重试提交失败，未自动重试。");
         }
     };
 
@@ -502,7 +436,7 @@ export default function ImagePage() {
                                 {results.map((result, index) =>
                                     result.status === "success" && result.image ? (
                                         <ResultImageCard key={result.id} image={result.image} index={index} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} />
-                                    ) : result.status === "failed" ? (
+                                    ) : result.status === "failed" || result.status === "interrupted" ? (
                                         <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={() => retryResult(index)} />
                                     ) : (
                                         <PendingImageCard key={result.id} />
@@ -588,8 +522,9 @@ function ResultImageCard({
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
     return (
         <div className="overflow-hidden rounded-lg border border-stone-200 bg-background dark:border-stone-800">
-            <Image src={previewUrlFor(image.storageKey) || image.dataUrl} preview={{ src: image.dataUrl }} alt={t("imageWorkbench.resultAlt", { count: index + 1 })} className="aspect-square object-cover" />
+            {image.dataUrl ? <Image src={previewUrlFor(image.storageKey) || image.dataUrl} preview={{ src: image.dataUrl }} alt={t("imageWorkbench.resultAlt", { count: index + 1 })} className="aspect-square object-cover" /> : <div className="flex aspect-square items-center justify-center p-5 text-center text-sm text-stone-500">图片已生成，但媒体未保存，当前无法预览。</div>}
             <div className="space-y-2 border-t border-stone-200 px-3 py-2.5 dark:border-stone-800">
+                {image.mediaStorageError ? <Typography.Paragraph className="!mb-0 !text-xs !text-red-500">{image.mediaStorageError}</Typography.Paragraph> : null}
                 <div className="flex min-w-0 gap-x-2 gap-y-1 text-xs text-stone-500 dark:text-stone-400">
                     <span>
                         {image.width}x{image.height}
@@ -599,17 +534,17 @@ function ResultImageCard({
                 </div>
                 <div className="grid min-w-0 grid-cols-3 gap-2">
                     <Tooltip title={t("common.addToAssets")}>
-                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => void onSaveAsset(image, index)}>
+                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" disabled={!image.dataUrl} icon={<FolderPlus className="size-3.5" />} onClick={() => void onSaveAsset(image, index)}>
                             {t("common.addToAssets")}
                         </Button>
                     </Tooltip>
                     <Tooltip title={t("imageWorkbench.addReference")}>
-                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<PenLine className="size-3.5" />} onClick={() => void onEdit(image, index)}>
+                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" disabled={!image.dataUrl} icon={<PenLine className="size-3.5" />} onClick={() => void onEdit(image, index)}>
                             {t("imageWorkbench.addReference")}
                         </Button>
                     </Tooltip>
                     <Tooltip title={t("common.download")}>
-                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<Download className="size-3.5" />} onClick={() => onDownload(image, index)}>
+                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" disabled={!image.dataUrl} icon={<Download className="size-3.5" />} onClick={() => onDownload(image, index)}>
                             {t("common.download")}
                         </Button>
                     </Tooltip>
@@ -655,10 +590,6 @@ function FailedImageCard({ error, onRetry }: { error: string; onRetry: () => voi
             </div>
         </div>
     );
-}
-
-function updateResultAt(results: GenerationResult[], index: number, next: Partial<GenerationResult>) {
-    return results.map((item, itemIndex) => (itemIndex === index ? { ...item, ...next } : item));
 }
 
 function LogPanel({
@@ -722,6 +653,7 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
     const { t } = useTranslation();
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
     const thumbnails = log.images.filter((image) => image.dataUrl).slice(0, 4);
+    const mediaStorageError = log.images.find((image) => image.mediaStorageError)?.mediaStorageError;
 
     return (
         <button
@@ -734,6 +666,15 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                     <Checkbox className="mt-0.5" checked={selected} onClick={(event) => event.stopPropagation()} onChange={(event) => onSelectedChange(event.target.checked)} />
                     <div className="min-w-0">
                         <div className="truncate text-sm font-semibold leading-5">{log.title}</div>
+                        {log.status === "pending" || log.status === "interrupted" || log.retryOf || log.persistenceError || mediaStorageError ? (
+                            <div className="mt-1 flex flex-wrap gap-1">
+                                {log.status === "pending" ? <Tag className="m-0" color="processing">{t("workbench.generating")}</Tag> : null}
+                                {log.status === "interrupted" ? <Tag className="m-0" color="warning">已中断</Tag> : null}
+                                {log.retryOf ? <Tooltip title={`原任务 ${log.retryOf.taskId} · 原结果 ${log.retryOf.slotId}`}><Tag className="m-0">{t("workbench.retry")}</Tag></Tooltip> : null}
+                                {log.persistenceError ? <Tooltip title={log.persistenceError}><Tag className="m-0" color="error">历史保存异常</Tag></Tooltip> : null}
+                                {mediaStorageError ? <Tooltip title={mediaStorageError}><Tag className="m-0" color="error">媒体保存异常</Tag></Tooltip> : null}
+                            </div>
+                        ) : null}
                         {thumbnails.length ? (
                             <div className="mt-2 flex gap-1 overflow-hidden">
                                 {thumbnails.map((image) => (
@@ -769,72 +710,6 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
     );
 }
 
-async function readStoredLogs() {
-    if (typeof window === "undefined") return [];
-    try {
-        const values: GenerationLog[] = [];
-        await logStore.iterate<GenerationLog, void>((value) => {
-            values.push(value);
-        });
-        const logs = await Promise.all(values.map(normalizeLog));
-        return logs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    } catch {
-        return [];
-    }
-}
-
-async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog> {
-    const references = await Promise.all(
-        (log.references || []).map(async (item) => {
-            void ensureImagePreview(item.storageKey);
-            return { ...item, dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl) };
-        }),
-    );
-    const images = await Promise.all(
-        (log.images || []).map(async (item) => {
-            void ensureImagePreview(item.storageKey);
-            return { ...item, dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl) };
-        }),
-    );
-    const config = normalizeLogConfig(log);
-    return {
-        id: log.id || nanoid(),
-        createdAt: log.createdAt || Date.now(),
-        title: log.title || log.model || i18n.t("workbench.untitled"),
-        prompt: log.prompt || log.title || "",
-        time: log.time || new Date().toLocaleString(i18n.resolvedLanguage, { hour12: false }),
-        model: log.model || config.imageModel || "",
-        config,
-        references,
-        durationMs: log.durationMs || 0,
-        successCount: log.successCount ?? log.imageCount ?? 0,
-        failCount: log.failCount || 0,
-        imageCount: log.imageCount || log.successCount || 0,
-        size: log.size || config.size || "",
-        quality: log.quality || config.quality || "",
-        status: log.status || "success",
-        images,
-    };
-}
-
-function serializeLog(log: GenerationLog): GenerationLog {
-    return {
-        ...log,
-        references: log.references.map((item) => ({ ...item, dataUrl: item.storageKey ? "" : item.dataUrl })),
-        images: log.images.map((image) => ({ ...image, dataUrl: image.storageKey ? "" : image.dataUrl })),
-    };
-}
-
-function normalizeLogConfig(log: Partial<GenerationLog>): GenerationLogConfig {
-    return {
-        model: log.config?.model || log.model || "",
-        imageModel: log.config?.imageModel || log.model || "",
-        quality: log.config?.quality || log.quality || "",
-        size: log.config?.size || log.size || "",
-        count: log.config?.count || String(log.imageCount || log.successCount || 1),
-    };
-}
-
 function moveListItem<T>(items: T[], index: number, offset: number) {
     const targetIndex = index + offset;
     if (targetIndex < 0 || targetIndex >= items.length) return items;
@@ -851,52 +726,4 @@ function ReferenceOrderButtons({ index, total, onMove }: { index: number; total:
             <Button size="small" className="!h-6 !w-6 !min-w-6 !rounded-full !bg-white/85 !p-0 !shadow-sm" icon={<ArrowRight className="size-3" />} disabled={index >= total - 1} onClick={() => onMove(1)} />
         </div>
     );
-}
-
-function buildLog({
-    prompt,
-    model,
-    config,
-    references,
-    durationMs,
-    successCount,
-    failCount,
-    status,
-    images,
-}: {
-    prompt: string;
-    model: string;
-    config: GenerationLogConfig;
-    references: ReferenceImage[];
-    durationMs: number;
-    successCount: number;
-    failCount: number;
-    status: GenerationLog["status"];
-    images: GeneratedImage[];
-}): GenerationLog {
-    const logConfig = {
-        model: config.model,
-        imageModel: config.imageModel,
-        quality: config.quality,
-        size: config.size,
-        count: config.count,
-    };
-    return {
-        id: nanoid(),
-        createdAt: Date.now(),
-        title: prompt.slice(0, 12) || i18n.t("workbench.untitled"),
-        prompt,
-        time: new Date().toLocaleString(i18n.resolvedLanguage, { hour12: false }),
-        model,
-        config: logConfig,
-        references,
-        durationMs,
-        successCount,
-        failCount,
-        imageCount: Number(logConfig.count) || successCount,
-        size: logConfig.size,
-        quality: logConfig.quality,
-        status,
-        images,
-    };
 }
