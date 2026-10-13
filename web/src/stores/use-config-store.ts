@@ -499,6 +499,7 @@ export function normalizeLocalProxyUrl(value: string) {
 
 /** Prefix an outgoing request with the local forwarding proxy so the browser is not blocked by CORS. */
 export function withLocalProxy(url: string) {
+    if (import.meta.env.VITE_CANVAS_SAME_ORIGIN_PROXY === "1" && /^https?:\/\//i.test(url)) return `/canvas-api/${url}`;
     const { proxyEnabled, proxyUrl } = useConfigStore.getState().config;
     if (!proxyEnabled || !/^https?:\/\//i.test(url)) return url;
     const base = normalizeLocalProxyUrl(proxyUrl);

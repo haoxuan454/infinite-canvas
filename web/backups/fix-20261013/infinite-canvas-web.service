@@ -1,0 +1,14 @@
+[Unit]
+Description=Infinite Canvas Web (Vite preview) - localhost only
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/usr/local/src/infinite-canvas/web
+ExecStart=/data/usr/local/src/infinite-canvas/web/node_modules/.bin/vite preview --host 127.0.0.1 --port 3000 --strictPort
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

@@ -13,6 +13,8 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
     const { t } = useTranslation();
     const [draft, setDraft] = useState<ModelChannel | null>(channel);
     const [selectOpen, setSelectOpen] = useState(false);
+    const [manualName, setManualName] = useState("");
+    const [manualCapability, setManualCapability] = useState<ModelCapability>("text");
     const [scriptTarget, setScriptTarget] = useState<ScriptTarget | null>(null);
     const apiFormatOptions: Array<{ label: string; value: ApiCallFormat }> = [
         { label: t("config.channelEditor.protocols.responses"), value: "openai" },
@@ -94,6 +96,14 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                 </Button>
             </div>
 
+            <div className="mb-3 flex flex-wrap gap-2">
+                <Input className="min-w-40 flex-1" placeholder={t("config.modelSelect.modelName")} value={manualName} onChange={(event) => setManualName(event.target.value)} />
+                <Select value={manualCapability} options={capabilityOptions} onChange={setManualCapability} style={{ width: 100 }} />
+                <Button disabled={!manualName.trim() || draft.models.some((model) => model.name === manualName.trim())} onClick={() => { setModels([...draft.models, { name: manualName.trim(), capability: manualCapability }]); setManualName(""); }}>
+                    {t("config.modelSelect.add")}
+                </Button>
+            </div>
+            <p className="mb-3 text-xs text-stone-500">{t("config.modelSelect.description")}</p>
             <div className="space-y-2 rounded-lg border border-stone-200 p-2 dark:border-stone-800">
                 {draft.models.length ? (
                     draft.models.map((model) => (
