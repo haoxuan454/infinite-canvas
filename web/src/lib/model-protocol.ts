@@ -1,12 +1,12 @@
 export type ApiCallFormat = "openai" | "openai-chat" | "gemini";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 
-export const MODEL_PROTOCOLS = ["auto", "openai-chat", "openai-responses", "openai-images", "gemini-image", "ark-seedream", "openai-video", "ark-video", "gemini-video", "custom-script"] as const;
+export const MODEL_PROTOCOLS = ["auto", "openai-chat", "openai-responses", "openai-images", "gemini-image", "ark-seedream", "openai-video", "video-generations", "ark-video", "gemini-video", "custom-script"] as const;
 export type ModelProtocol = (typeof MODEL_PROTOCOLS)[number];
 export const MODEL_PROTOCOLS_BY_CAPABILITY: Record<ModelCapability, readonly ModelProtocol[]> = {
     text: ["auto", "openai-chat", "openai-responses"],
     image: ["auto", "openai-images", "gemini-image", "ark-seedream", "custom-script"],
-    video: ["auto", "openai-video", "ark-video", "gemini-video", "custom-script"],
+    video: ["auto", "openai-video", "video-generations", "ark-video", "gemini-video", "custom-script"],
     audio: ["auto", "custom-script"],
 };
 
@@ -17,6 +17,7 @@ const PROTOCOL_API_FORMATS: Record<Exclude<ModelProtocol, "auto" | "custom-scrip
     "gemini-image": "gemini",
     "ark-seedream": "openai",
     "openai-video": "openai",
+    "video-generations": "openai",
     "ark-video": "openai",
     "gemini-video": "gemini",
 };

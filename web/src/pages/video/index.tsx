@@ -314,9 +314,21 @@ export default function VideoPage() {
         setStartedAt((value) => value || performance.now());
         setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
         const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
+        let transientErrors = 0;
         try {
             for (let attempt = 0; attempt < 120; attempt += 1) {
-                const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
+                let state;
+                try {
+                    state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
+                } catch (error) {
+                    // 查询/下载的临时网络错误不应误标终态；连续多次失败才视为不可恢复。
+                    if (error instanceof DOMException && error.name === "AbortError") throw error;
+                    transientErrors += 1;
+                    if (transientErrors >= 5) throw error;
+                    await delay(5000);
+                    continue;
+                }
+                transientErrors = 0;
                 if (state.status === "completed") {
                     const stored = await storeGeneratedVideo(state.result);
                     const nextVideo: GeneratedVideo = {
