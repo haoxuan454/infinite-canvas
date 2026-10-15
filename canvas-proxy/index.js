@@ -73,6 +73,56 @@ function requestHeaders(req) {
     return headers;
 }
 
+// ---- 平台渠道请求体模型别名改写（真实模型名绝不下发浏览器，服务端按 alias→model 映射换回）----
+function transformManagedModelBody(body, contentType, aliasMap) {
+    if (!aliasMap || aliasMap.size === 0) return body;
+    const ctype = String(contentType).toLowerCase();
+    if (ctype.includes("application/json")) {
+        try {
+            const parsed = JSON.parse(body.toString("utf8"));
+            if (parsed && typeof parsed.model === "string" && aliasMap.has(parsed.model)) {
+                parsed.model = aliasMap.get(parsed.model);
+                return Buffer.from(JSON.stringify(parsed), "utf8");
+            }
+        } catch {}
+        return body;
+    }
+    if (ctype.includes("multipart/form-data")) {
+        const replaced = replaceMultipartModel(body, contentType, aliasMap);
+        if (replaced) return replaced;
+    }
+    return body;
+}
+
+function replaceMultipartModel(body, contentType, aliasMap) {
+    const match = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(String(contentType));
+    if (!match) return null;
+    const dashBoundary = Buffer.from(`--${(match[1] || match[2]).trim()}`, "utf8");
+    const segments = [];
+    let idx = body.indexOf(dashBoundary);
+    while (idx !== -1) {
+        const next = body.indexOf(dashBoundary, idx + dashBoundary.length);
+        segments.push(body.slice(idx, next === -1 ? body.length : next));
+        if (next === -1) break;
+        idx = next;
+    }
+    if (segments.length < 2) return null;
+    let changed = false;
+    const rebuilt = segments.map((seg) => {
+        const headerEnd = seg.indexOf("\r\n\r\n");
+        if (headerEnd === -1) return seg;
+        const headers = seg.slice(0, headerEnd).toString("utf8");
+        if (!/(^|[;\s])name="model"/i.test(headers)) return seg;
+        const trailingCrlf = seg.length >= 2 && seg[seg.length - 2] === 13 && seg[seg.length - 1] === 10 ? 2 : 0;
+        const content = seg.slice(headerEnd + 4, seg.length - trailingCrlf);
+        const value = content.toString("utf8");
+        if (!aliasMap.has(value)) return seg;
+        changed = true;
+        return Buffer.concat([seg.slice(0, headerEnd + 4), Buffer.from(aliasMap.get(value), "utf8"), trailingCrlf ? Buffer.from("\r\n") : Buffer.alloc(0)]);
+    });
+    return changed ? Buffer.concat(rebuilt) : null;
+}
+
 function responseHeaders(upstream) {
     const headers = { ...CORS_HEADERS };
     upstream.headers.forEach((value, key) => {
@@ -95,7 +145,7 @@ function logForward(method, target, outcome, startedAt) {
     }
 }
 
-async function forward(req, res, target, log) {
+async function forward(req, res, target, log, options) {
     const startedAt = Date.now();
     const record = log.start(req.method || "GET", target);
     const controller = new AbortController();
@@ -130,23 +180,35 @@ async function forward(req, res, target, log) {
     req.once("aborted", cancel);
     res.once("close", onClose);
     res.once("finish", onFinish);
+    const upstreamHeadersInit = requestHeaders(req);
     try {
         const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
         if (settled || req.aborted || res.destroyed) {
             cancel();
             return;
         }
-        if (body) {
+        // 平台渠道别名改写：请求体里的 model=显示别名 换回真实模型名（真实名绝不下发浏览器）。
+        let forwardBody = body;
+        if (body && typeof options?.transformBody === "function") {
             try {
-                const model = JSON.parse(body.toString("utf8"))?.model;
+                const transformed = options.transformBody(body, req.headers["content-type"] || "");
+                if (transformed && transformed.length !== body.length) {
+                    forwardBody = transformed;
+                    upstreamHeadersInit["content-length"] = String(transformed.length);
+                } else if (transformed) forwardBody = transformed;
+            } catch {}
+        }
+        if (forwardBody) {
+            try {
+                const model = JSON.parse(forwardBody.toString("utf8"))?.model;
                 if (typeof model === "string") record.model = redact(model, 128);
             } catch {}
         }
         // 托管渠道：按最长前缀匹配注入服务器持有的上游 Key（浏览器不接触上游 Key）。
-        const upstreamHeaders = requestHeaders(req);
+        const upstreamHeaders = { ...upstreamHeadersInit };
         const channel = adminStore.matchChannelForTarget(target);
         if (channel) upstreamHeaders.authorization = `Bearer ${channel.apiKey}`;
-        const upstream = await fetch(target, { method: req.method, headers: upstreamHeaders, body, redirect: "follow", signal: controller.signal });
+        const upstream = await fetch(target, { method: req.method, headers: upstreamHeaders, body: forwardBody, redirect: "follow", signal: controller.signal });
         if (settled) {
             await upstream.body?.cancel();
             return;
@@ -313,7 +375,8 @@ export function createProxyServer() {
             const queryIndex = (req.url || "").indexOf("?");
             const search = queryIndex >= 0 ? (req.url || "").slice(queryIndex) : "";
             const managedTarget = `${apiBase}${endpointPath}${search}`;
-            forward(req, res, managedTarget, log).catch(() => {
+            const aliasMap = adminStore.managedModelAliasMap(channel);
+            forward(req, res, managedTarget, log, { transformBody: (body, contentType) => transformManagedModelBody(body, contentType, aliasMap) }).catch(() => {
                 if (res.headersSent) res.destroy();
                 else sendJson(res, 502, { error: "代理请求失败" });
             });

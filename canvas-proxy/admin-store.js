@@ -204,29 +204,65 @@ function normalizeChannelModels(models) {
     const list = models.slice(0, 100).map((entry) => {
         if (typeof entry === "string") {
             const model = entry.trim().slice(0, 120);
-            return model ? { model, capability: "text", protocol: "auto" } : null;
+            return model ? { model, capability: "text", protocol: "auto", alias: "" } : null;
         }
         const model = String(entry?.model || "").trim().slice(0, 120);
         if (!model) return null;
         const capability = CHANNEL_CAPABILITIES.has(entry?.capability) ? entry.capability : "text";
         const protocol = String(entry?.protocol || "auto").trim().slice(0, 40) || "auto";
-        return { model, capability, protocol };
+        // alias = 面向用户的显示名称（用户端绝不下发真实模型名）。
+        const alias = String(entry?.alias || "").trim().slice(0, 80);
+        return { model, capability, protocol, alias };
     }).filter(Boolean);
     // 同渠道内去重（模型+能力组合）。
     const seen = new Set();
-    return list.filter((m) => {
+    const deduped = list.filter((m) => {
         const token = `${m.model}|${m.capability}`;
         if (seen.has(token)) return false;
         seen.add(token);
         return true;
     });
+    // 别名同渠道内唯一：留空走按能力+序号的动态兜底；重复则追加序号。
+    const used = new Set();
+    return deduped.map((m) => {
+        if (!m.alias) return m;
+        let candidate = m.alias;
+        let n = 2;
+        while (used.has(candidate)) candidate = `${m.alias}-${n++}`;
+        used.add(candidate);
+        return { ...m, alias: candidate };
+    });
+}
+
+/** 用户侧展示名清单：优先管理员定义的 alias，否则按 能力-序号 兜底（按能力分别计数，兜底名不含真实模型名）。 */
+function publicModelNames(models) {
+    const counters = {};
+    return models.map((m) => {
+        counters[m.capability] = (counters[m.capability] || 0) + 1;
+        return m.alias || `${m.capability}-${counters[m.capability]}`;
+    });
+}
+
+/** 别名 → 真实模型名映射（托管转发改写请求体 model 字段用）。 */
+export function managedModelAliasMap(channel) {
+    const models = normalizeChannelModels(channel?.models || []);
+    const names = publicModelNames(models);
+    const map = new Map();
+    models.forEach((m, i) => {
+        if (!map.has(names[i])) map.set(names[i], m.model);
+    });
+    return map;
 }
 
 export function listChannels() { return state.channels.map((c) => ({ ...c, models: normalizeChannelModels(c.models) })); }
 
-/** 平台渠道分发视图（供持有效访问 Key 的用户端同步）：绝不含 baseUrl / apiKey。 */
+/** 平台渠道分发视图（供持有效访问 Key 的用户端同步）：绝不含 baseUrl / apiKey / 真实模型名，模型只出显示别名。 */
 export function listManagedChannelsPublic() {
-    return state.channels.map((c) => ({ id: c.id, name: c.name, models: normalizeChannelModels(c.models), createdAt: c.createdAt }));
+    return state.channels.map((c) => {
+        const models = normalizeChannelModels(c.models);
+        const names = publicModelNames(models);
+        return { id: c.id, name: c.name, models: models.map((m, i) => ({ name: names[i], capability: m.capability, protocol: m.protocol })), createdAt: c.createdAt };
+    });
 }
 
 export function findChannelById(id) { return state.channels.find((c) => c.id === id) || null; }

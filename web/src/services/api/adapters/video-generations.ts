@@ -74,7 +74,7 @@ export async function pollVideoGenerationsTask(config: AiConfig, task: VideoGene
     const rawUrl = [payload.video?.url, payload.video_url, payload.url].find((value) => typeof value === "string" && value.trim()) as string | undefined;
     const versionBase = normalizeVersionBase(config.baseUrl);
     // 先在上游侧解析出绝对 URL 并校验，再决定是否携带 Bearer，最后统一经同源代理发出，避免浏览器直连上游触发 CORS。
-    const upstreamUrl = rawUrl ? resolveUpstreamUrl(rawUrl, versionBase) : `${versionBase}/videos/${encodeURIComponent(task.id)}/content`;
+    const upstreamUrl = resolveContentUrl(rawUrl?.trim(), versionBase, task.id);
     const upstreamOrigin = safeOriginOf(upstreamUrl);
     const sameOrigin = upstreamOrigin !== "" && upstreamOrigin === safeOriginOf(versionBase);
     const { data: blob } = await axios.get<Blob>(withLocalProxy(upstreamUrl), {
@@ -83,10 +83,22 @@ export async function pollVideoGenerationsTask(config: AiConfig, task: VideoGene
     return { status: "completed", result: await toVideoResult(blob) };
 }
 
-function resolveUpstreamUrl(raw: string, base: string) {
-    // 平台渠道内部地址不是合法绝对 base；raw 通常已是上游返回的绝对 URL，此时 base 不参与，兜底用当前 origin。
-    const safeBase = /^https?:\/\//i.test(base) ? base : window.location.origin;
-    const url = new URL(raw, safeBase);
+/**
+ * 解析成片下载地址。
+ * - 绝对 URL（上游/CDN 直链）原样使用；
+ * - 相对路径按渠道版本根解析：绝对渠道走 URL 语义；托管渠道（内部路径 /canvas-api/__managed/<id>[/vN]）必须字符串拼回内部路径，
+ *   绝不能落到当前页面 origin（否则会请求应用自身导致 502），版本段保留交给服务端按真实 baseUrl 归一。
+ */
+function resolveContentUrl(raw: string | undefined, versionBase: string, taskId: string) {
+    if (!raw) return `${versionBase}/videos/${encodeURIComponent(taskId)}/content`;
+    if (/^https?:\/\//i.test(raw)) return assertSafeHttpUrl(raw);
+    if (/^https?:\/\//i.test(versionBase)) return assertSafeHttpUrl(new URL(raw, `${versionBase}/`).toString());
+    const managedRoot = versionBase.replace(/\/v\d+(?:beta\d*)?$/i, "");
+    return `${managedRoot}/${raw.replace(/^\/+/, "")}`;
+}
+
+function assertSafeHttpUrl(value: string) {
+    const url = new URL(value);
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error(apiText("videoDownloadFailed"));
     return url.toString();
 }

@@ -11,7 +11,7 @@ import { MODEL_PROTOCOLS_BY_CAPABILITY } from "@/lib/model-protocol";
 
 type AccessKey = { key: string; keyMasked: string; name: string; createdAt: number; expiresAt: number | null; maxDevices: number; revokedAt: number | null; note: string; deviceCount: number };
 type Device = { id: string; key: string; fingerprint: string; ip: string; userAgent: string; firstSeen: number; lastSeen: number; blockedAt: number | null };
-type ChannelModelEntry = { model: string; capability: "text" | "image" | "video" | "audio"; protocol: string };
+type ChannelModelEntry = { model: string; capability: "text" | "image" | "video" | "audio"; protocol: string; alias?: string };
 type Channel = { id: string; name: string; baseUrl: string; apiKey: string; models: ChannelModelEntry[]; createdAt: number; source: string };
 type Report = { id: string; baseUrl: string; apiKey: string; model: string; fingerprint: string; userAgent: string; ip: string; accessKeyLabel: string; createdAt: number };
 type Overview = { keysTotal: number; keysActive: number; keysExpired: number; devicesTotal: number; devicesBlocked: number; channelsTotal: number; reportsTotal: number; enforcement: boolean };
@@ -45,6 +45,13 @@ function relativeTime(value: number | null | undefined) {
     if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m`;
     if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h`;
     return `${Math.floor(diff / 86_400_000)}d`;
+}
+
+/** 表格内长串（apiKey/baseUrl）中间省略展示；完整内容点击查看弹窗 + 一键复制。 */
+function maskMiddle(value: string) {
+    const s = String(value || "");
+    if (s.length <= 16) return s;
+    return `${s.slice(0, 10)}••••••${s.slice(-6)}`;
 }
 
 function CopyButton({ text, label }: { text: string; label?: string }) {
@@ -140,6 +147,7 @@ export default function AdminPage() {
     const [channelEditor, setChannelEditor] = useState<Partial<Channel> | null>(null);
     const [fetchedModels, setFetchedModels] = useState<string[]>([]);
     const [fetchingModels, setFetchingModels] = useState(false);
+    const [secretViewer, setSecretViewer] = useState<{ title: string; value: string } | null>(null);
 
     const refreshAll = useCallback(async () => {
         try {
@@ -262,11 +270,24 @@ export default function AdminPage() {
         finally { setFetchingModels(false); }
     };
     const pickedFetched = (channelEditor?.models || []).filter((m) => fetchedModels.includes(m.model)).map((m) => m.model);
-    // 多选勾选 → 结构化模型行（能力按名称推断、协议默认 auto，均可逐行修改）；不在清单内的手动行原样保留。
+    // 多选勾选 → 结构化模型行（能力按名称推断、协议默认 auto、显示别名按能力自动编号，均可逐行修改）；不在清单内的手动行原样保留。
     const applyPickedModels = (selected: string[]) => {
         if (!channelEditor) return;
+        const aliasLabels: Record<string, string> = { text: "文本", image: "生图", video: "视频", audio: "音频" };
+        const counters: Record<string, number> = {};
         const manual = (channelEditor.models || []).filter((m) => m.model.trim() && !fetchedModels.includes(m.model));
-        setChannelEditor({ ...channelEditor, models: [...selected.map((name) => ({ model: name, capability: guessModelCapability(name), protocol: "auto" })), ...manual] });
+        setChannelEditor({
+            ...channelEditor,
+            models: [
+                ...selected.map((name) => {
+                    const capability = guessModelCapability(name);
+                    const label = aliasLabels[capability] || capability;
+                    counters[capability] = (counters[capability] || 0) + 1;
+                    return { model: name, capability, protocol: "auto", alias: `${label}-${counters[capability]}` };
+                }),
+                ...manual,
+            ],
+        });
     };
 
     const filteredDevices = useMemo(() => (deviceKeyFilter ? devices.filter((d) => d.key === deviceKeyFilter) : devices), [devices, deviceKeyFilter]);
@@ -453,9 +474,20 @@ export default function AdminPage() {
                                         locale={{ emptyText: <Empty description={t("admin.channels.empty")} /> }}
                                         columns={[
                                             { title: t("admin.channels.name"), dataIndex: "name", width: 140 },
-                                            { title: t("admin.channels.baseUrl"), dataIndex: "baseUrl", render: (v: string) => <span className="font-mono text-xs">{v}</span> },
-                                            { title: t("admin.channels.apiKey"), dataIndex: "apiKey", render: (v: string) => <Space size={0}><span className="font-mono text-xs">{v}</span><CopyButton text={v} /></Space> },
-                                            { title: t("admin.channels.models"), dataIndex: "models", render: (v: ChannelModelEntry[]) => <span className="text-xs text-stone-500">{v?.length ? v.map((m) => `${m.model}(${m.capability})`).join("、") : "-"}</span> },
+                                            { title: t("admin.channels.baseUrl"), dataIndex: "baseUrl", width: 220, render: (v: string) => (
+                                                <button type="button" className="max-w-full truncate font-mono text-xs underline decoration-dotted underline-offset-2" title={t("admin.reports.viewHint")} onClick={() => setSecretViewer({ title: t("admin.channels.baseUrl"), value: v })}>
+                                                    {maskMiddle(v)}
+                                                </button>
+                                            ) },
+                                            { title: t("admin.channels.apiKey"), dataIndex: "apiKey", width: 220, render: (v: string) => (
+                                                <Space size={4} className="max-w-full">
+                                                    <button type="button" className="truncate font-mono text-xs text-rose-600 underline decoration-dotted underline-offset-2 dark:text-rose-400" title={t("admin.reports.viewHint")} onClick={() => setSecretViewer({ title: t("admin.channels.apiKey"), value: v })}>
+                                                        {maskMiddle(v)}
+                                                    </button>
+                                                    <CopyButton text={v} />
+                                                </Space>
+                                            ) },
+                                            { title: t("admin.channels.models"), dataIndex: "models", render: (v: ChannelModelEntry[]) => <span className="text-xs text-stone-500">{v?.length ? v.map((m) => `${m.alias || m.model}（${m.capability}${m.alias ? `，真实: ${m.model}` : ""}）`).join("、") : "-"}</span> },
                                             { title: t("admin.channels.createdAt"), dataIndex: "createdAt", width: 140, render: (v: number) => <span className="font-mono text-xs">{formatDate(v)}</span> },
                                             { title: t("admin.devices.actions"), width: 80, render: (_: unknown, c: Channel) => <Space size={4}><Button size="small" onClick={() => setChannelEditor(c)}>{t("common.edit")}</Button><Popconfirm title={t("admin.channels.deleteConfirm")} onConfirm={() => void deleteChannel(c.id)}><Button size="small" type="text" danger icon={<Trash2 className="size-3.5" />} /></Popconfirm></Space> },
                                         ]}
@@ -476,8 +508,19 @@ export default function AdminPage() {
                                         pagination={{ pageSize: 15, hideOnSinglePage: true }}
                                         locale={{ emptyText: <Empty description={t("admin.reports.empty")} /> }}
                                         columns={[
-                                            { title: t("admin.reports.baseUrl"), dataIndex: "baseUrl", render: (v: string) => <span className="font-mono text-xs">{v}</span> },
-                                            { title: t("admin.reports.apiKey"), dataIndex: "apiKey", render: (v: string) => <Space size={0}><span className="font-mono text-xs text-rose-600 dark:text-rose-400">{v}</span><CopyButton text={v} /></Space> },
+                                            { title: t("admin.reports.baseUrl"), dataIndex: "baseUrl", width: 220, render: (v: string) => (
+                                                <button type="button" className="max-w-full truncate font-mono text-xs underline decoration-dotted underline-offset-2" title={t("admin.reports.viewHint")} onClick={() => setSecretViewer({ title: t("admin.reports.baseUrl"), value: v })}>
+                                                    {maskMiddle(v)}
+                                                </button>
+                                            ) },
+                                            { title: t("admin.reports.apiKey"), dataIndex: "apiKey", width: 220, render: (v: string) => (
+                                                <Space size={4} className="max-w-full">
+                                                    <button type="button" className="truncate font-mono text-xs text-rose-600 underline decoration-dotted underline-offset-2 dark:text-rose-400" title={t("admin.reports.viewHint")} onClick={() => setSecretViewer({ title: t("admin.reports.apiKey"), value: v })}>
+                                                        {maskMiddle(v)}
+                                                    </button>
+                                                    <CopyButton text={v} />
+                                                </Space>
+                                            ) },
                                             { title: t("admin.reports.model"), dataIndex: "model", width: 160, ellipsis: true, render: (v: string) => <span className="text-xs">{v || "-"}</span> },
                                             { title: t("admin.devices.fingerprint"), dataIndex: "fingerprint", width: 130, render: (v: string) => <span className="font-mono text-xs text-stone-500">{v?.slice(0, 16)}…</span> },
                                             { title: t("admin.devices.ip"), dataIndex: "ip", width: 120, render: (v: string) => <span className="font-mono text-xs">{v || "-"}</span> },
@@ -637,6 +680,13 @@ export default function AdminPage() {
                                 {(channelEditor.models || []).map((entry, index) => (
                                     <div key={index} className="flex flex-wrap items-center gap-2">
                                         <Input
+                                            className="w-32 shrink-0"
+                                            value={entry.alias || ""}
+                                            placeholder={t("admin.channels.aliasPlaceholder")}
+                                            title={t("admin.channels.aliasTitle")}
+                                            onChange={(e) => setChannelEditor({ ...channelEditor, models: (channelEditor.models || []).map((x, i) => (i === index ? { ...x, alias: e.target.value } : x)) })}
+                                        />
+                                        <Input
                                             className="min-w-36 flex-1"
                                             value={entry.model}
                                             placeholder="doubao-seedream-5-0-pro-260628"
@@ -662,7 +712,7 @@ export default function AdminPage() {
                                 className="mt-2"
                                 size="small"
                                 icon={<Plus className="size-3.5" />}
-                                onClick={() => setChannelEditor({ ...channelEditor, models: [...(channelEditor.models || []), { model: "", capability: "text", protocol: "auto" }] })}
+                                onClick={() => setChannelEditor({ ...channelEditor, models: [...(channelEditor.models || []), { model: "", capability: "text", protocol: "auto", alias: "" }] })}
                             >
                                 {t("admin.channels.addModel")}
                             </Button>
@@ -670,6 +720,18 @@ export default function AdminPage() {
                     </div>
                 ) : null}
             </Drawer>
+            {/* 长字段明文查看：apiKey / baseUrl 点击遮罩串后弹出，附一键复制。 */}
+            <Modal open={Boolean(secretViewer)} title={secretViewer?.title} onCancel={() => setSecretViewer(null)} footer={null} width={640} centered>
+                {secretViewer ? (
+                    <div className="space-y-3">
+                        <Input.TextArea readOnly value={secretViewer.value} autoSize={{ minRows: 2, maxRows: 8 }} className="font-mono !text-xs" />
+                        <div className="flex justify-end gap-2">
+                            <Button icon={<Copy className="size-3.5" />} onClick={() => { navigator.clipboard.writeText(secretViewer.value).then(() => message.success(t("common.copied"))).catch(() => message.error(t("common.copyFailed"))); }}>{t("common.copy")}</Button>
+                            <Button type="primary" onClick={() => setSecretViewer(null)}>{t("common.close")}</Button>
+                        </div>
+                    </div>
+                ) : null}
+            </Modal>
         </main>
     );
 }

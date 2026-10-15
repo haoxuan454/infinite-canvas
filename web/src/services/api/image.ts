@@ -166,11 +166,44 @@ function resolveRequestSize(size: string) {
     if (!value || value.toLowerCase() === "auto") return undefined;
     const dimensions = parseImageDimensions(value);
     if (dimensions) {
-        validateImageSize(dimensions.width, dimensions.height);
-        return `${dimensions.width}x${dimensions.height}`;
+        // 视频面板与生图共用 size 字段，可能写入低于生图下限的像素（如视频 720x720）：按比例自动钳制到合法范围而不是直接报错。
+        const clamped = clampImageDimensions(dimensions.width, dimensions.height);
+        validateImageSize(clamped.width, clamped.height);
+        return `${clamped.width}x${clamped.height}`;
     }
-    if (value.includes(":")) return resolveSize(value);
+    if (value.includes(":")) {
+        // 比例路径（如 4:3 → 1024x768=786432）同样可能低于上游面积下限，统一过一次钳制。
+        const preset = resolveSize(value);
+        const presetDims = parseImageDimensions(preset);
+        if (presetDims) {
+            const clampedRatio = clampImageDimensions(presetDims.width, presetDims.height);
+            validateImageSize(clampedRatio.width, clampedRatio.height);
+            return `${clampedRatio.width}x${clampedRatio.height}`;
+        }
+        return preset;
+    }
     throw new Error(apiText("invalidImageSizeFormat"));
+}
+
+/** 像素越界时按原宽高比缩放并吸附到 16 步长；缩放取整回落导致仍越界时按步长补足。
+ * 下限取 921600（=960x960，方舟等上游实测最低面积要求，高于本地 655360）：所有低于该面积的尺寸一律自动放大，避免上游 InvalidParameter。 */
+function clampImageDimensions(width: number, height: number) {
+    const minPixels = Math.max(IMAGE_MIN_PIXELS, 921600);
+    const pixels = width * height;
+    const scale = pixels < minPixels ? Math.sqrt(minPixels / pixels) : pixels > IMAGE_MAX_PIXELS ? Math.sqrt(IMAGE_MAX_PIXELS / pixels) : 1;
+    if (scale === 1) return { width, height };
+    const snap = (v: number) => Math.max(IMAGE_SIZE_STEP, Math.round((v * scale) / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP);
+    let w = snap(width);
+    let h = snap(height);
+    while (w * h < minPixels) {
+        w += IMAGE_SIZE_STEP;
+        h += IMAGE_SIZE_STEP;
+    }
+    while (w * h > IMAGE_MAX_PIXELS) {
+        w -= IMAGE_SIZE_STEP;
+        h -= IMAGE_SIZE_STEP;
+    }
+    return { width: w, height: h };
 }
 
 function resolveGeminiImageConfig(config: AiConfig) {

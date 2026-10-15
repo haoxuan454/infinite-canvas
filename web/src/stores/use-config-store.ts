@@ -546,7 +546,7 @@ export function withLocalProxy(url: string) {
 
 // ---------- 平台渠道同步（管理员托管分发；真实 baseUrl / apiKey 永不下发浏览器） ----------
 
-type ManagedChannelPayload = { id: string; name: string; models?: { model?: string; capability?: string; protocol?: string }[] };
+type ManagedChannelPayload = { id: string; name: string; models?: { name?: string; model?: string; capability?: string; protocol?: string }[] };
 
 /**
  * 拉取管理员分发的平台渠道并合入本地渠道列表：
@@ -582,7 +582,8 @@ export async function syncManagedChannels(): Promise<boolean> {
             apiKey: "",
             apiFormat: "openai",
             models: (server.models || []).flatMap((m) => {
-                const name = String(m?.model || "").trim();
+                // 服务端公开清单下发的是对外显示名（别名，不含真实模型名），历史形态兜底读 model 字段。
+                const name = String(m?.name || m?.model || "").trim();
                 if (!name) return [];
                 const capability = capabilityOf(m?.capability);
                 return [{ name, capability, protocol: normalizeModelProtocol(m?.protocol, capability) }];
