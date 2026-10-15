@@ -253,6 +253,72 @@ export function createProxyServer() {
             sendJson(res, 200, result);
             return;
         }
+        // 进门即登记设备（POST /auth/bind）：走真实 authenticate（登记台账/校验 maxDevices），限流与 verify 共用。
+        if (path === "/auth/bind") {
+            if ((req.method || "") !== "POST") {
+                sendJson(res, 405, { error: "只允许 POST" });
+                return;
+            }
+            if (!verifyRateOk(req.socket?.remoteAddress || "")) {
+                sendJson(res, 429, { error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" });
+                return;
+            }
+            const auth = adminStore.authenticate(req.headers["x-access-key"], req.headers["x-device-id"], { ip: req.socket?.remoteAddress || "", userAgent: req.headers["user-agent"] || "" });
+            if (!auth.ok) {
+                sendJson(res, auth.status, { error: AUTH_ERRORS[auth.code] || "访问被拒绝", code: auth.code });
+                return;
+            }
+            sendJson(res, 200, { ok: true, bootstrap: !!auth.bootstrap, device: auth.device ? { id: auth.device.id, lastSeen: auth.device.lastSeen } : null });
+            return;
+        }
+        // 平台渠道分发（需有效访问 Key）：渠道清单绝不含 baseUrl/apiKey；内部转发由服务端换算真实上游并注入 Bearer。
+        // 兼容两种到达形态：同源代理（vite 剥前缀 → /__managed...）与经典本地代理（/canvas-api/__managed...）。
+        const managedPath = path.startsWith("/canvas-api/__managed") ? path.slice("/canvas-api".length) : path;
+        if (managedPath === "/__managed-channels") {
+            const auth = adminStore.authenticate(req.headers["x-access-key"], req.headers["x-device-id"], { ip: req.socket?.remoteAddress || "", userAgent: req.headers["user-agent"] || "" });
+            if (!auth.ok) {
+                sendJson(res, auth.status, { error: AUTH_ERRORS[auth.code] || "访问被拒绝", code: auth.code });
+                return;
+            }
+            sendJson(res, 200, { channels: adminStore.listManagedChannelsPublic() });
+            return;
+        }
+        if (managedPath === "/__managed" || managedPath.startsWith("/__managed/")) {
+            const auth = adminStore.authenticate(req.headers["x-access-key"], req.headers["x-device-id"], { ip: req.socket?.remoteAddress || "", userAgent: req.headers["user-agent"] || "" });
+            if (!auth.ok) {
+                sendJson(res, auth.status, { error: AUTH_ERRORS[auth.code] || "访问被拒绝", code: auth.code });
+                return;
+            }
+            const rest = managedPath.slice("/__managed/".length);
+            const slash = rest.indexOf("/");
+            const channelId = slash === -1 ? rest : rest.slice(0, slash);
+            const endpointPathRaw = slash === -1 ? "" : rest.slice(slash);
+            if (!/^[0-9a-f]{8,64}$/i.test(channelId) || !endpointPathRaw.startsWith("/") || endpointPathRaw.includes("..")) {
+                sendJson(res, 404, { error: "平台渠道不存在或路径非法", code: "MANAGED_CHANNEL_NOT_FOUND" });
+                return;
+            }
+            // 版本归一：客户端可能带版本段（gemini /v1beta、video-generations /v1）或不带（buildApiUrl 平台分支）。
+            // 记住客户端版本段并剥离；真实 baseUrl 自带 /vN 则用之，否则用客户端版本段（缺省 /v1）补齐。
+            let endpointPath = endpointPathRaw;
+            const channel = adminStore.findChannelById(channelId);
+            if (!channel) {
+                sendJson(res, 404, { error: "平台渠道不存在或已下线", code: "MANAGED_CHANNEL_NOT_FOUND" });
+                return;
+            }
+            const versionMatch = endpointPath.match(/^\/v\d+(?:beta\d*)?(?=\/)/i);
+            const clientVersion = versionMatch ? versionMatch[0] : "";
+            if (clientVersion) endpointPath = endpointPath.slice(clientVersion.length);
+            const channelBase = channel.baseUrl;
+            const apiBase = /\/v\d+(?:beta\d*)?$/i.test(channelBase) ? channelBase : `${channelBase}${clientVersion || "/v1"}`;
+            const queryIndex = (req.url || "").indexOf("?");
+            const search = queryIndex >= 0 ? (req.url || "").slice(queryIndex) : "";
+            const managedTarget = `${apiBase}${endpointPath}${search}`;
+            forward(req, res, managedTarget, log).catch(() => {
+                if (res.headersSent) res.destroy();
+                else sendJson(res, 502, { error: "代理请求失败" });
+            });
+            return;
+        }
         const target = readTarget(req.url || "/");
         if (!target) {
             const stats = adminStore.overview();

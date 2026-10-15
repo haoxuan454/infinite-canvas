@@ -3,7 +3,7 @@ import axios from "axios";
 import i18n from "@/i18n";
 import { audioMimeType, normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue } from "@/lib/audio-generation";
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { buildApiUrl, isManagedBaseUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
 import { withAuthHeaders } from "@/lib/access-control";
 
@@ -29,7 +29,8 @@ export async function requestAudioGeneration(config: AiConfig, prompt: string, o
     if (script) {
         if (!model) throw new Error(apiText("audioModelRequired"));
         if (!requestConfig.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
-        if (!requestConfig.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
+        // 平台（托管分发）渠道：上游 Key 只存服务器，本地 apiKey 恒为空，放行。
+        if (!requestConfig.apiKey.trim() && !isManagedBaseUrl(requestConfig.baseUrl)) throw new Error(apiText("apiKeyRequired"));
         try {
             const result = await runModelPlugin({
                 capability: "audio",
@@ -89,7 +90,8 @@ export async function storeGeneratedAudio(blob: Blob, format = "mp3"): Promise<U
 function assertAudioConfig(config: AiConfig, model: string) {
     if (!model) throw new Error(apiText("audioModelRequired"));
     if (!config.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
-    if (!config.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
+    // 平台（托管分发）渠道：上游 Key 由代理注入，本地 apiKey 恒为空，放行。
+    if (!config.apiKey.trim() && !isManagedBaseUrl(config.baseUrl)) throw new Error(apiText("apiKeyRequired"));
     if (config.apiFormat === "gemini") throw new Error(apiText("geminiAudioUnsupported"));
 }
 

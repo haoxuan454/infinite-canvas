@@ -196,7 +196,40 @@ export function deleteDevice(id) {
 
 // ---------- 托管上游渠道（服务器持有上游 Key，浏览器不接触） ----------
 
-export function listChannels() { return state.channels.map((c) => ({ ...c })); }
+const CHANNEL_CAPABILITIES = new Set(["text", "image", "video", "audio"]);
+
+/** 渠道模型清单归一化：兼容旧字符串数组（默认 text/auto），新格式为 {model, capability, protocol}。 */
+function normalizeChannelModels(models) {
+    if (!Array.isArray(models)) return [];
+    const list = models.slice(0, 100).map((entry) => {
+        if (typeof entry === "string") {
+            const model = entry.trim().slice(0, 120);
+            return model ? { model, capability: "text", protocol: "auto" } : null;
+        }
+        const model = String(entry?.model || "").trim().slice(0, 120);
+        if (!model) return null;
+        const capability = CHANNEL_CAPABILITIES.has(entry?.capability) ? entry.capability : "text";
+        const protocol = String(entry?.protocol || "auto").trim().slice(0, 40) || "auto";
+        return { model, capability, protocol };
+    }).filter(Boolean);
+    // 同渠道内去重（模型+能力组合）。
+    const seen = new Set();
+    return list.filter((m) => {
+        const token = `${m.model}|${m.capability}`;
+        if (seen.has(token)) return false;
+        seen.add(token);
+        return true;
+    });
+}
+
+export function listChannels() { return state.channels.map((c) => ({ ...c, models: normalizeChannelModels(c.models) })); }
+
+/** 平台渠道分发视图（供持有效访问 Key 的用户端同步）：绝不含 baseUrl / apiKey。 */
+export function listManagedChannelsPublic() {
+    return state.channels.map((c) => ({ id: c.id, name: c.name, models: normalizeChannelModels(c.models), createdAt: c.createdAt }));
+}
+
+export function findChannelById(id) { return state.channels.find((c) => c.id === id) || null; }
 
 export function upsertChannel({ id, name, baseUrl, apiKey, models = [] }) {
     const base = String(baseUrl || "").trim().replace(/\/+$/, "");
@@ -211,8 +244,8 @@ export function upsertChannel({ id, name, baseUrl, apiKey, models = [] }) {
     record.name = String(name || base).slice(0, 64);
     record.baseUrl = base;
     record.apiKey = String(apiKey);
-    record.models = Array.isArray(models) ? models.map((m) => String(m).slice(0, 120)).slice(0, 100) : [];
-    audit("channel.upsert", `${record.name} ${base}`);
+    record.models = normalizeChannelModels(models);
+    audit("channel.upsert", `${record.name} ${base} 模型x${record.models.length}`);
     save();
     return record;
 }

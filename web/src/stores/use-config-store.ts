@@ -4,6 +4,7 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { accessAuthHeaders } from "@/lib/access-control";
 import { normalizeModelMaxSeconds } from "@/lib/video-duration";
 import { normalizeModelProtocol, resolveModelProtocolExecution, type ApiCallFormat, type ModelCapability, type ModelProtocol } from "@/lib/model-protocol";
 
@@ -27,6 +28,9 @@ export type ModelChannel = {
     apiKey: string;
     apiFormat: ApiCallFormat;
     models: ChannelModel[];
+    /** 平台渠道（管理员托管分发）：baseUrl 为同源内部路径，真实上游地址只在服务器。 */
+    managed?: boolean;
+    managedId?: string;
 };
 
 export type AiConfig = {
@@ -227,7 +231,10 @@ export function resolveModelScript(config: AiConfig, value: string) {
 
 function isAiConfigReady(config: AiConfig, model: string) {
     const match = findChannelModel(config, model);
-    return Boolean(match && match.channel.baseUrl.trim() && match.channel.apiKey.trim());
+    if (!match) return false;
+    // 平台（托管分发）渠道：上游 Key 只存服务器，本地 apiKey 恒为空——只要求内部转发地址存在。
+    if (match.channel.managed) return Boolean(match.channel.baseUrl.trim());
+    return Boolean(match.channel.baseUrl.trim() && match.channel.apiKey.trim());
 }
 
 export const useConfigStore = create<ConfigStore>()(
@@ -340,6 +347,7 @@ export function createModelChannel(channel?: Partial<ModelChannel>): ModelChanne
         apiKey: channel?.apiKey || "",
         apiFormat,
         models: normalizeChannelModels(channel?.models),
+        ...(channel?.managed ? { managed: true, managedId: channel.managedId } : {}),
     };
 }
 
@@ -505,8 +513,15 @@ function uniqueModelOptions(models: string[]) {
     return Array.from(new Set((models || []).map((model) => model.trim()).filter(Boolean)));
 }
 
+/** 平台（托管分发）渠道的内部同源地址：真实 baseUrl 只存在于服务器，浏览器全程不可见。 */
+export function isManagedBaseUrl(baseUrl: string) {
+    return /^\/canvas-api\/__managed\/[0-9a-f]{8,64}$/i.test(baseUrl.trim());
+}
+
 export function buildApiUrl(baseUrl: string, path: string) {
     const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
+    // 平台渠道：版本拼接由服务端按真实 baseUrl 决定，客户端直走同源内部路径。
+    if (isManagedBaseUrl(normalizedBaseUrl)) return `${normalizedBaseUrl}${path}`;
     const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
     // Preserve an explicit API version (for example Ark /api/v3), not only /v1.
     const apiBaseUrl = /\/v\d+(?:beta\d*)?$/.test(lowerBaseUrl) ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
@@ -527,4 +542,53 @@ export function withLocalProxy(url: string) {
     const base = normalizeLocalProxyUrl(proxyUrl);
     if (!base || url.startsWith(`${base}/`)) return url;
     return `${base}/${url}`;
+}
+
+// ---------- 平台渠道同步（管理员托管分发；真实 baseUrl / apiKey 永不下发浏览器） ----------
+
+type ManagedChannelPayload = { id: string; name: string; models?: { model?: string; capability?: string; protocol?: string }[] };
+
+/**
+ * 拉取管理员分发的平台渠道并合入本地渠道列表：
+ * - 平台渠道以服务端为准（新增/更新/下线自动同步），本地 id 稳定为 managed-<服务端id>；
+ * - baseUrl 为同源内部路径 /canvas-api/__managed/<id>，浏览器不可见真实上游；
+ * - 用户自定义渠道（无 managed 标记）原样保留、互不影响；
+ * - 端点不可达（未开同源代理/代理未启动）静默跳过，与密钥门 fail-open 口径一致。
+ */
+export async function syncManagedChannels(): Promise<boolean> {
+    let serverChannels: ManagedChannelPayload[] = [];
+    try {
+        const response = await fetch("/canvas-api/__managed-channels", {
+            headers: accessAuthHeaders(),
+            cache: "no-store",
+            signal: AbortSignal.timeout(8000),
+        });
+        if (!response.ok) return false;
+        const payload = (await response.json()) as { channels?: ManagedChannelPayload[] };
+        serverChannels = Array.isArray(payload?.channels) ? payload.channels : [];
+    } catch {
+        return false;
+    }
+    const current = useConfigStore.getState().config.channels;
+    const customs = current.filter((channel) => !channel.managed);
+    const managed: ModelChannel[] = serverChannels.map((server) => {
+        const capabilityOf = (value?: string): ModelCapability => (value === "image" || value === "video" || value === "audio" || value === "text" ? value : "text");
+        return {
+            id: `managed-${server.id}`,
+            managedId: server.id,
+            managed: true,
+            name: server.name,
+            baseUrl: `/canvas-api/__managed/${server.id}`,
+            apiKey: "",
+            apiFormat: "openai",
+            models: (server.models || []).flatMap((m) => {
+                const name = String(m?.model || "").trim();
+                if (!name) return [];
+                const capability = capabilityOf(m?.capability);
+                return [{ name, capability, protocol: normalizeModelProtocol(m?.protocol, capability) }];
+            }),
+        };
+    });
+    useConfigStore.getState().updateConfig("channels", [...managed, ...customs]);
+    return true;
 }

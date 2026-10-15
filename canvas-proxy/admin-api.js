@@ -102,6 +102,36 @@ async function handleAdminRoute(req, res, sub) {
         try { const record = store.upsertChannel(body); return sendJson(res, 200, { channel: record }); }
         catch (error) { return sendJson(res, error.status || 400, { error: error.message }); }
     }
+    // 拉取上游渠道的可用模型清单（服务端代拉：上游 Key 不经过浏览器之外的第二方）。
+    if (method === "POST" && sub === "/channels/fetch-models") {
+        const body = await json();
+        const baseUrl = String(body.baseUrl || "").trim().replace(/\/+$/, "");
+        const apiKey = String(body.apiKey || "").trim();
+        if (!/^https?:\/\//i.test(baseUrl)) return sendJson(res, 400, { error: "baseUrl 必须以 http(s):// 开头" });
+        if (!apiKey) return sendJson(res, 400, { error: "apiKey 不能为空" });
+        const lower = baseUrl.toLowerCase();
+        // 版本归一：与 /__managed 转发同规则——baseUrl 自带 /vN（含 /api/v3）则用之，否则补 /v1。
+        const apiBase = /\/v\d+(?:beta\d*)?$/.test(lower) ? baseUrl : `${baseUrl}/v1`;
+        const isGemini = /(^|\.)generativelanguage\.googleapis\.com$/i.test(new URL(apiBase).hostname);
+        const headers = isGemini ? { "x-goog-api-key": apiKey, accept: "application/json" } : { authorization: `Bearer ${apiKey}`, accept: "application/json" };
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15000);
+        try {
+            const upstream = await fetch(`${apiBase}/models`, { headers, signal: controller.signal, redirect: "follow" });
+            const text = await upstream.text();
+            if (!upstream.ok) return sendJson(res, 502, { error: `上游返回 ${upstream.status}${text ? `：${text.slice(0, 200)}` : ""}` });
+            let payload;
+            try { payload = JSON.parse(text); } catch { return sendJson(res, 502, { error: "上游响应不是合法 JSON" }); }
+            const list = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : Array.isArray(payload) ? payload : [];
+            const models = Array.from(new Set(list.map((m) => String((typeof m === "string" ? m : m?.id || m?.name) || "").trim().replace(/^models\//, "")).filter(Boolean)));
+            return sendJson(res, 200, { models: models.slice(0, 500) });
+        } catch (error) {
+            const reason = error?.name === "AbortError" ? "上游请求超时（15s）" : error?.cause?.code || error?.message || "网络错误";
+            return sendJson(res, 502, { error: `拉取失败：${reason}` });
+        } finally {
+            clearTimeout(timer);
+        }
+    }
     if (method === "DELETE" && seg[0] === "channels" && seg[1]) return sendJson(res, store.deleteChannel(decodeURIComponent(seg[1])) ? 200 : 404, { ok: true });
     if (method === "GET" && sub === "/reports") return sendJson(res, 200, { reports: store.listChannelReports() });
     if (method === "DELETE" && seg[0] === "reports" && seg[1]) return sendJson(res, store.deleteChannelReport(decodeURIComponent(seg[1])) ? 200 : 404, { ok: true });

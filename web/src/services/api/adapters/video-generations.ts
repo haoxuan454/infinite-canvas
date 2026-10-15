@@ -24,6 +24,15 @@ function normalizeVersionBase(baseUrl: string) {
     return base;
 }
 
+/** 平台渠道内部地址不是绝对 URL；宽松取 origin，取不到返回空串（视为不同源，鉴权交给代理注入）。 */
+function safeOriginOf(value: string) {
+    try {
+        return new URL(value).origin;
+    } catch {
+        return "";
+    }
+}
+
 function createUrl(config: Pick<AiConfig, "baseUrl">) {
     return withLocalProxy(`${normalizeVersionBase(config.baseUrl)}/videos/generations`);
 }
@@ -66,7 +75,8 @@ export async function pollVideoGenerationsTask(config: AiConfig, task: VideoGene
     const versionBase = normalizeVersionBase(config.baseUrl);
     // 先在上游侧解析出绝对 URL 并校验，再决定是否携带 Bearer，最后统一经同源代理发出，避免浏览器直连上游触发 CORS。
     const upstreamUrl = rawUrl ? resolveUpstreamUrl(rawUrl, versionBase) : `${versionBase}/videos/${encodeURIComponent(task.id)}/content`;
-    const sameOrigin = new URL(upstreamUrl).origin === new URL(versionBase).origin;
+    const upstreamOrigin = safeOriginOf(upstreamUrl);
+    const sameOrigin = upstreamOrigin !== "" && upstreamOrigin === safeOriginOf(versionBase);
     const { data: blob } = await axios.get<Blob>(withLocalProxy(upstreamUrl), {
         responseType: "blob", headers: sameOrigin ? aiHeaders(config) : {}, signal: options?.signal, timeout: VIDEO_REQUEST_TIMEOUT_MS,
     });
@@ -74,7 +84,9 @@ export async function pollVideoGenerationsTask(config: AiConfig, task: VideoGene
 }
 
 function resolveUpstreamUrl(raw: string, base: string) {
-    const url = new URL(raw, base);
+    // 平台渠道内部地址不是合法绝对 base；raw 通常已是上游返回的绝对 URL，此时 base 不参与，兜底用当前 origin。
+    const safeBase = /^https?:\/\//i.test(base) ? base : window.location.origin;
+    const url = new URL(raw, safeBase);
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error(apiText("videoDownloadFailed"));
     return url.toString();
 }

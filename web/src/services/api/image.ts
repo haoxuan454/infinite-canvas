@@ -1,6 +1,7 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
+import { authHeadersIfProxied } from "@/lib/access-control";
 import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
@@ -431,9 +432,10 @@ function consumeResponseStreamText(state: ResponseStreamState, text: string, onD
 }
 
 async function requestStreamingResponse(config: AiConfig, body: Record<string, unknown>, onDelta?: (text: string) => void, options?: RequestOptions): Promise<ToolResponseResult> {
-    const response = await fetch(aiApiUrl(config, "/responses"), {
+    const requestUrl = aiApiUrl(config, "/responses");
+    const response = await fetch(requestUrl, {
         method: "POST",
-        headers: { ...aiHeaders(config, "application/json"), Accept: "text/event-stream" },
+        headers: { ...aiHeaders(config, "application/json"), ...authHeadersIfProxied(requestUrl), Accept: "text/event-stream" },
         body: JSON.stringify({ ...body, stream: true }),
         signal: options?.signal,
     });
@@ -516,9 +518,10 @@ function chatPayloadText(payload: Record<string, unknown>) {
 
 /** OpenAI Chat Completions protocol (/v1/chat/completions), streamed via SSE. */
 async function requestChatCompletionText(config: AiConfig, messages: ResponseInputMessage[], onDelta?: (text: string) => void, options?: RequestOptions): Promise<string> {
-    const response = await fetch(aiApiUrl(config, "/chat/completions"), {
+    const requestUrl = aiApiUrl(config, "/chat/completions");
+    const response = await fetch(requestUrl, {
         method: "POST",
-        headers: { ...aiHeaders(config, "application/json"), Accept: "text/event-stream" },
+        headers: { ...aiHeaders(config, "application/json"), ...authHeadersIfProxied(requestUrl), Accept: "text/event-stream" },
         body: JSON.stringify({ model: config.model, messages: toChatMessages(messages), stream: true }),
         signal: options?.signal,
     });
@@ -627,9 +630,10 @@ function toGeminiToolOptions(tools: ResponseFunctionTool[], toolChoice: ToolChoi
 }
 
 async function requestGeminiStreamingResponse(config: AiConfig, body: Record<string, unknown>, onDelta?: (text: string) => void, options?: RequestOptions): Promise<ToolResponseResult> {
-    const response = await fetch(`${geminiApiUrl(config, "streamGenerateContent")}?alt=sse`, {
+    const requestUrl = `${geminiApiUrl(config, "streamGenerateContent")}?alt=sse`;
+    const response = await fetch(requestUrl, {
         method: "POST",
-        headers: geminiHeaders(config),
+        headers: { ...geminiHeaders(config), ...authHeadersIfProxied(requestUrl) },
         body: JSON.stringify(body),
         signal: options?.signal,
     });

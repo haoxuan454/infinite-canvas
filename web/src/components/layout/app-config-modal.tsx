@@ -1,4 +1,4 @@
-import { App, Alert, Button, Form, Input, Modal, Progress, Radio, Select, Switch, Tabs } from "antd";
+import { App, Alert, Button, Form, Input, Modal, Progress, Radio, Select, Switch, Tabs, Tag } from "antd";
 import type { TFunction } from "i18next";
 import { Cloud, Download, KeyRound, Pencil, Plus, RefreshCw, Sparkles, Trash2, Upload, Wifi } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -110,6 +110,11 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
     };
 
     const deleteChannel = (id: string) => {
+        const target = config.channels.find((channel) => channel.id === id);
+        if (target?.managed) {
+            message.info(t("config.channels.managedLocked"));
+            return;
+        }
         if (config.channels.length <= 1) {
             message.warning(t("config.channels.keepOne"));
             return;
@@ -209,16 +214,25 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                     {config.channels.map((channel) => (
                                         <div key={channel.id} className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-4 py-3 dark:border-stone-800">
                                             <div className="min-w-0">
-                                                <div className="truncate text-sm font-semibold">{channel.name || t("config.channels.unnamed")}</div>
+                                                <div className="flex items-center gap-2 truncate text-sm font-semibold">
+                                                    {channel.name || t("config.channels.unnamed")}
+                                                    {channel.managed ? <Tag className="!mr-0 !rounded-full" color="purple">{t("config.channels.managedBadge")}</Tag> : null}
+                                                </div>
                                                 <div className="mt-1 truncate text-xs text-stone-500">
-                                                    {apiFormatLabel(channel.apiFormat)} · {t("config.channels.modelCount", { count: channel.models.length })} · {channel.baseUrl || t("config.channels.missingUrl")}
+                                                    {channel.managed
+                                                        ? `${apiFormatLabel(channel.apiFormat)} · ${t("config.channels.modelCount", { count: channel.models.length })} · ${t("config.channels.managedHosted")}`
+                                                        : `${apiFormatLabel(channel.apiFormat)} · ${t("config.channels.modelCount", { count: channel.models.length })} · ${channel.baseUrl || t("config.channels.missingUrl")}`}
                                                 </div>
                                             </div>
                                             <div className="flex shrink-0 gap-2">
-                                                <Button size="small" icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
-                                                    {t("common.edit")}
-                                                </Button>
-                                                <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
+                                                {channel.managed ? null : (
+                                                    <Button size="small" icon={<Pencil className="size-3.5" />} onClick={() => setEditingChannelId(channel.id)}>
+                                                        {t("common.edit")}
+                                                    </Button>
+                                                )}
+                                                {channel.managed ? null : (
+                                                    <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={() => deleteChannel(channel.id)} />
+                                                )}
                                             </div>
                                         </div>
                                     ))}

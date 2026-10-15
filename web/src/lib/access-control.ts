@@ -123,6 +123,14 @@ export function withAuthHeaders(extra?: HeadersInit): HeadersInit {
     return { ...(extra as Record<string, string> | undefined), ...accessAuthHeaders() };
 }
 
+/**
+ * 仅当请求经本项目同源代理（/canvas-api/...）时才附加访问鉴权头；
+ * 直连第三方上游的请求绝不携带，防止访问 Key / 设备指纹外泄。
+ */
+export function authHeadersIfProxied(url: string): Record<string, string> {
+    return url.startsWith("/canvas-api/") || url.includes("/canvas-api/https:") ? accessAuthHeaders() : {};
+}
+
 export function onAuthError(handler: (payload: { code?: string; error?: string }) => void) {
     const listener = (event: Event) => handler((event as CustomEvent).detail || {});
     window.addEventListener(AUTH_ERROR_EVENT, listener);
@@ -148,6 +156,65 @@ export async function verifyAccessKey(overrideKey?: string): Promise<AccessVerif
     const response = await fetch("/auth/verify", { headers, cache: "no-store", signal: AbortSignal.timeout(5000) });
     if (!response.ok) throw new Error(`verify http ${response.status}`);
     return (await response.json()) as AccessVerifyResult;
+}
+
+// ---------- 进门即登记设备（POST /auth/bind：真实 authenticate，含 maxDevices 校验） ----------
+
+const BIND_MARKER_KEY = "infinite-canvas:device_bound";
+
+function bindMarkerValue(effectiveKey: string) {
+    return `${getDeviceFingerprint()}|${stableHash(effectiveKey)}`;
+}
+
+function readBindMarker() {
+    try {
+        return localStorage.getItem(BIND_MARKER_KEY) || "";
+    } catch {
+        return "";
+    }
+}
+
+function rememberBound(effectiveKey: string) {
+    try {
+        localStorage.setItem(BIND_MARKER_KEY, bindMarkerValue(effectiveKey));
+    } catch {}
+}
+
+/** 当前设备+Key 组合是否已在本会话登记过（登记幂等，标记仅用于避免重复请求）。 */
+export function isDeviceBound() {
+    return readBindMarker() === bindMarkerValue(readAccessKey());
+}
+
+export type BindResult = { ok: boolean; code?: string; error?: string; bootstrap?: boolean };
+
+/**
+ * 调用代理端 /auth/bind 完成设备登记（设备台账立即可见）。
+ * overrideKey 用于门内提交场景（Key 尚未落库时显式传入）。
+ * 失败（Key 失效 / 设备超限 / 设备被禁）返回 ok:false + code，由密钥门决定拉回。
+ */
+export async function bindDevice(overrideKey?: string): Promise<BindResult> {
+    const effectiveKey = overrideKey ?? readAccessKey();
+    const headers = {
+        "content-type": "application/json",
+        ...(effectiveKey ? { "x-access-key": effectiveKey } : {}),
+        "x-device-id": getDeviceFingerprint(),
+    };
+    const response = await fetch("/auth/bind", {
+        method: "POST",
+        headers,
+        body: "{}",
+        cache: "no-store",
+        signal: AbortSignal.timeout(5000),
+    });
+    let payload: { ok?: boolean; code?: string; error?: string; bootstrap?: boolean } = {};
+    try {
+        payload = (await response.json()) as { ok?: boolean; code?: string; error?: string; bootstrap?: boolean };
+    } catch {
+        payload = {};
+    }
+    if (!response.ok) return { ok: false, code: payload.code, error: payload.error };
+    rememberBound(effectiveKey);
+    return { ok: true, bootstrap: payload.bootstrap };
 }
 
 // ---------- 自定义渠道上报（记录不可变，仅管理员可删） ----------

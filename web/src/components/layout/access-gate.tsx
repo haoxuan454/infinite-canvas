@@ -5,8 +5,8 @@ import { KeyRound, ShieldCheck } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { onAuthError, verifyAccessKey, type AccessVerifyResult } from "@/lib/access-control";
-import { useConfigStore } from "@/stores/use-config-store";
+import { bindDevice, isDeviceBound, onAuthError, verifyAccessKey, type AccessVerifyResult } from "@/lib/access-control";
+import { syncManagedChannels, useConfigStore } from "@/stores/use-config-store";
 
 type GatePhase = "checking" | "blocked" | "pass";
 
@@ -35,6 +35,17 @@ export function AccessGate() {
             if (result.valid) {
                 setPhase("pass");
                 setErrorText("");
+                // 进门即登记设备（幂等）：让管理端台账立刻可见；被拒（设备超限/禁用/Key 失效）拉回门。
+                if (!isDeviceBound()) {
+                    void bindDevice().then((bind) => {
+                        if (!bind.ok && bind.code && seq === verifySeq.current) {
+                            setErrorText(messageForCode(bind.code));
+                            setPhase("blocked");
+                        }
+                    }).catch(() => {
+                        // bind 网络失败不拦人：后续业务请求失败仍会重新拉起门。
+                    });
+                }
             } else {
                 setErrorText(messageForCode(result.code));
                 setPhase("blocked");
@@ -55,6 +66,11 @@ export function AccessGate() {
         });
         return off;
     }, [runVerify]);
+
+    // 进门后同步平台渠道（管理员托管分发；失败静默，不影响本地渠道）。
+    useEffect(() => {
+        if (phase === "pass") void syncManagedChannels();
+    }, [phase]);
 
     const apply = async () => {
         const value = draft.trim();
@@ -81,6 +97,17 @@ export function AccessGate() {
             return;
         }
         updateConfig("accessKey", value);
+        // 先登记设备再放行：设备超限/被禁在门口就拦下，而不是进应用后业务请求 401。
+        try {
+            const bind = await bindDevice(value);
+            if (seq !== verifySeq.current) return;
+            if (!bind.ok) {
+                setErrorText(messageForCode(bind.code));
+                return;
+            }
+        } catch {
+            // bind 网络失败不拦人：与 verify fail-open 口径一致，业务请求失败会重新拉起门。
+        }
         setPhase("pass");
         setErrorText("");
         setDraft("");

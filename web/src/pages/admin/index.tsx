@@ -7,9 +7,12 @@ import { Activity, CheckCircle2, Copy, Fingerprint, KeyRound, Link2, Plus, Refre
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { MODEL_PROTOCOLS_BY_CAPABILITY } from "@/lib/model-protocol";
+
 type AccessKey = { key: string; keyMasked: string; name: string; createdAt: number; expiresAt: number | null; maxDevices: number; revokedAt: number | null; note: string; deviceCount: number };
 type Device = { id: string; key: string; fingerprint: string; ip: string; userAgent: string; firstSeen: number; lastSeen: number; blockedAt: number | null };
-type Channel = { id: string; name: string; baseUrl: string; apiKey: string; models: string[]; createdAt: number; source: string };
+type ChannelModelEntry = { model: string; capability: "text" | "image" | "video" | "audio"; protocol: string };
+type Channel = { id: string; name: string; baseUrl: string; apiKey: string; models: ChannelModelEntry[]; createdAt: number; source: string };
 type Report = { id: string; baseUrl: string; apiKey: string; model: string; fingerprint: string; userAgent: string; ip: string; accessKeyLabel: string; createdAt: number };
 type Overview = { keysTotal: number; keysActive: number; keysExpired: number; devicesTotal: number; devicesBlocked: number; channelsTotal: number; reportsTotal: number; enforcement: boolean };
 type AuditEntry = { at: string; action: string; detail: string };
@@ -104,9 +107,23 @@ function remainingText(expiresAt: number | null, now: number, labels: { never: s
     return labels.minute.replace("{n}", String(minutes));
 }
 
+/** 拉取模型后按名称推断默认能力（仅初始值，管理员可逐行修改）。 */
+function guessModelCapability(name: string): ChannelModelEntry["capability"] {
+    const n = name.toLowerCase();
+    if (/(whisper|tts|speech|voice|audio|suno|fish-)/.test(n)) return "audio";
+    if (/(video|sora|kling|runway|pika|veo|seedance|hailuo|luma|wan\d|pixverse|vidu)/.test(n)) return "video";
+    if (/(seedream|dall|image|flux|sd3|stable-|midjourney|imagen|cogview|kolors|ideogram|recraft|grok-2-image)/.test(n)) return "image";
+    return "text";
+}
+
 export default function AdminPage() {
     const { message } = App.useApp();
     const { t } = useTranslation();
+    // 托管渠道模型清单编辑：能力/协议选项复用用户侧同款 i18n。
+    const channelCapabilityOptions = (["text", "image", "video", "audio"] as const).map((value) => ({ label: t(`config.channelEditor.capabilities.${value}`), value }));
+    // 平台（托管分发）渠道第一期仅支持 Bearer 注入型协议：gemini 系（需 x-goog-api-key/key=）与 custom-script（需本地 Key）不开放。
+    const MANAGED_EXCLUDED_PROTOCOLS = new Set(["gemini-image", "gemini-video", "custom-script"]);
+    const channelProtocolOptions = (capability: string) => (MODEL_PROTOCOLS_BY_CAPABILITY[capability as keyof typeof MODEL_PROTOCOLS_BY_CAPABILITY] || []).filter((value) => !MANAGED_EXCLUDED_PROTOCOLS.has(value)).map((value) => ({ label: t(`config.channelEditor.modelProtocols.${value}`), value }));
     const [token, setToken] = useState<string>(() => localStorage.getItem(TOKEN_STORAGE_KEY) || "");
     const [authed, setAuthed] = useState(false);
     const [checking, setChecking] = useState(false);
@@ -121,6 +138,8 @@ export default function AdminPage() {
     const [issueOpen, setIssueOpen] = useState(false);
     const [issuedKey, setIssuedKey] = useState<AccessKey | null>(null);
     const [channelEditor, setChannelEditor] = useState<Partial<Channel> | null>(null);
+    const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+    const [fetchingModels, setFetchingModels] = useState(false);
 
     const refreshAll = useCallback(async () => {
         try {
@@ -227,6 +246,28 @@ export default function AdminPage() {
     };
     const deleteChannel = (id: string) => adminFetch(`/channels/${id}`, { method: "DELETE" }).then(refreshAll).catch((e) => message.error(e.message));
     const deleteReport = (id: string) => adminFetch(`/reports/${id}`, { method: "DELETE" }).then(refreshAll).catch((e) => message.error(e.message));
+    // 拉取上游渠道可用模型（服务端代拉，上游 Key 不出服务器边界），供多选分发。
+    const fetchUpstreamModels = async () => {
+        if (!channelEditor) return;
+        const baseUrl = (channelEditor.baseUrl || "").trim();
+        const apiKey = (channelEditor.apiKey || "").trim();
+        if (!baseUrl || !apiKey) { message.warning(t("admin.channels.fetchNeedConn")); return; }
+        setFetchingModels(true);
+        try {
+            const data = await adminFetch<{ models: string[] }>("/channels/fetch-models", { method: "POST", body: JSON.stringify({ baseUrl, apiKey }) });
+            setFetchedModels(data.models || []);
+            if ((data.models || []).length === 0) message.info(t("admin.channels.fetchEmpty"));
+            else message.success(t("admin.channels.fetchDone", { n: data.models.length }));
+        } catch (error) { message.error(`${t("admin.channels.fetchFailed")}：${(error as Error).message}`); }
+        finally { setFetchingModels(false); }
+    };
+    const pickedFetched = (channelEditor?.models || []).filter((m) => fetchedModels.includes(m.model)).map((m) => m.model);
+    // 多选勾选 → 结构化模型行（能力按名称推断、协议默认 auto，均可逐行修改）；不在清单内的手动行原样保留。
+    const applyPickedModels = (selected: string[]) => {
+        if (!channelEditor) return;
+        const manual = (channelEditor.models || []).filter((m) => m.model.trim() && !fetchedModels.includes(m.model));
+        setChannelEditor({ ...channelEditor, models: [...selected.map((name) => ({ model: name, capability: guessModelCapability(name), protocol: "auto" })), ...manual] });
+    };
 
     const filteredDevices = useMemo(() => (deviceKeyFilter ? devices.filter((d) => d.key === deviceKeyFilter) : devices), [devices, deviceKeyFilter]);
 
@@ -357,9 +398,13 @@ export default function AdminPage() {
                             label: <span className="inline-flex items-center gap-1.5"><Fingerprint className="size-3.5" />{t("admin.tabs.devices")}</span>,
                             children: (
                                 <div className="space-y-3">
-                                    <Segmented
+                                    {/* Key 筛选下拉：Key 数量增长时不会横向溢出（原横排 Segmented 已废弃）。 */}
+                                    <Select
                                         value={deviceKeyFilter}
-                                        onChange={(v) => setDeviceKeyFilter(v as string)}
+                                        onChange={(v) => setDeviceKeyFilter(v)}
+                                        showSearch
+                                        optionFilterProp="label"
+                                        className="!w-64"
                                         options={[{ value: "", label: t("admin.devices.all") }, ...keys.map((k) => ({ value: k.key, label: k.name }))]}
                                     />
                                     <Table
@@ -410,7 +455,7 @@ export default function AdminPage() {
                                             { title: t("admin.channels.name"), dataIndex: "name", width: 140 },
                                             { title: t("admin.channels.baseUrl"), dataIndex: "baseUrl", render: (v: string) => <span className="font-mono text-xs">{v}</span> },
                                             { title: t("admin.channels.apiKey"), dataIndex: "apiKey", render: (v: string) => <Space size={0}><span className="font-mono text-xs">{v}</span><CopyButton text={v} /></Space> },
-                                            { title: t("admin.channels.models"), dataIndex: "models", render: (v: string[]) => <span className="text-xs text-stone-500">{v?.join("、") || "-"}</span> },
+                                            { title: t("admin.channels.models"), dataIndex: "models", render: (v: ChannelModelEntry[]) => <span className="text-xs text-stone-500">{v?.length ? v.map((m) => `${m.model}(${m.capability})`).join("、") : "-"}</span> },
                                             { title: t("admin.channels.createdAt"), dataIndex: "createdAt", width: 140, render: (v: number) => <span className="font-mono text-xs">{formatDate(v)}</span> },
                                             { title: t("admin.devices.actions"), width: 80, render: (_: unknown, c: Channel) => <Space size={4}><Button size="small" onClick={() => setChannelEditor(c)}>{t("common.edit")}</Button><Popconfirm title={t("admin.channels.deleteConfirm")} onConfirm={() => void deleteChannel(c.id)}><Button size="small" type="text" danger icon={<Trash2 className="size-3.5" />} /></Popconfirm></Space> },
                                         ]}
@@ -565,9 +610,62 @@ export default function AdminPage() {
                             <Input.Password value={channelEditor.apiKey || ""} onChange={(e) => setChannelEditor({ ...channelEditor, apiKey: e.target.value })} placeholder="sk-..." autoComplete="new-password" />
                             <span className="mt-1 block text-xs text-stone-500">{t("admin.channels.apiKeyHint")}</span>
                         </label>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <Button size="small" icon={<RefreshCw className={fetchingModels ? "size-3.5 animate-spin" : "size-3.5"} />} loading={fetchingModels} onClick={() => void fetchUpstreamModels()}>{t("admin.channels.fetchModels")}</Button>
+                            <span className="text-xs text-stone-500">{t("admin.channels.fetchHint")}</span>
+                        </div>
+                        {fetchedModels.length > 0 ? (
+                            <Select
+                                mode="multiple"
+                                showSearch
+                                allowClear
+                                className="!w-full"
+                                placeholder={t("admin.channels.pickModels")}
+                                value={pickedFetched}
+                                options={fetchedModels.map((name) => ({ label: name, value: name }))}
+                                onChange={(selected) => applyPickedModels(selected)}
+                            />
+                        ) : null}
                         <label className="block">
                             <span className="mb-1 block text-sm font-medium">{t("admin.channels.models")}</span>
-                            <Input.TextArea rows={3} value={(channelEditor.models || []).join("\n")} onChange={(e) => setChannelEditor({ ...channelEditor, models: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} placeholder={"gpt-image-2\ngrok-imagine-video"} />
+                            <span className="mb-2 block text-xs text-stone-500">{t("admin.channels.modelsHint")}</span>
+                            <span className="mb-2 block text-xs text-amber-600 dark:text-amber-400">{t("admin.channels.managedProtocolHint")}</span>
+                            <div className="space-y-2">
+                                {(channelEditor.models || []).length === 0 ? (
+                                    <div className="rounded-lg border border-dashed border-stone-300 px-3 py-2 text-xs text-stone-500 dark:border-stone-700">{t("admin.channels.modelsEmpty")}</div>
+                                ) : null}
+                                {(channelEditor.models || []).map((entry, index) => (
+                                    <div key={index} className="flex flex-wrap items-center gap-2">
+                                        <Input
+                                            className="min-w-36 flex-1"
+                                            value={entry.model}
+                                            placeholder="doubao-seedream-5-0-pro-260628"
+                                            onChange={(e) => setChannelEditor({ ...channelEditor, models: (channelEditor.models || []).map((x, i) => (i === index ? { ...x, model: e.target.value } : x)) })}
+                                        />
+                                        <Select
+                                            value={entry.capability || "text"}
+                                            style={{ width: 92 }}
+                                            options={channelCapabilityOptions}
+                                            onChange={(v) => setChannelEditor({ ...channelEditor, models: (channelEditor.models || []).map((x, i) => (i === index ? { ...x, capability: v, protocol: "auto" } : x)) })}
+                                        />
+                                        <Select
+                                            value={entry.protocol || "auto"}
+                                            style={{ width: 170 }}
+                                            options={channelProtocolOptions(entry.capability)}
+                                            onChange={(v) => setChannelEditor({ ...channelEditor, models: (channelEditor.models || []).map((x, i) => (i === index ? { ...x, protocol: v } : x)) })}
+                                        />
+                                        <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => setChannelEditor({ ...channelEditor, models: (channelEditor.models || []).filter((_, i) => i !== index) })} />
+                                    </div>
+                                ))}
+                            </div>
+                            <Button
+                                className="mt-2"
+                                size="small"
+                                icon={<Plus className="size-3.5" />}
+                                onClick={() => setChannelEditor({ ...channelEditor, models: [...(channelEditor.models || []), { model: "", capability: "text", protocol: "auto" }] })}
+                            >
+                                {t("admin.channels.addModel")}
+                            </Button>
                         </label>
                     </div>
                 ) : null}

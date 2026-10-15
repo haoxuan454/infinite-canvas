@@ -1,4 +1,4 @@
-import { Button, Drawer, Input, InputNumber, Segmented, Select, Space } from "antd";
+import { Alert, Button, Drawer, Input, InputNumber, Segmented, Select, Space } from "antd";
 import { ListPlus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -49,6 +49,9 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
 
     if (!draft) return null;
 
+    // 平台渠道（管理员托管分发）：只读展示，真实 baseUrl / 模型清单由服务端同步，用户不可改。
+    const isManaged = Boolean(draft.managed);
+
     const patch = (value: Partial<ModelChannel>) => setDraft((current) => (current ? { ...current, ...value } : current));
     const setModels = (models: ChannelModel[]) => patch({ models });
 
@@ -96,23 +99,24 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                 </Space>
             }
         >
+            {isManaged ? <Alert className="!mb-4" type="info" showIcon message={t("config.channelEditor.managedNotice")} /> : null}
             <div className="grid gap-4 md:grid-cols-2">
                 <label className="block">
                     <span className="mb-1 block text-sm font-medium">{t("config.channelEditor.name")}</span>
-                    <Input value={draft.name} onChange={(event) => patch({ name: event.target.value })} />
+                    <Input value={draft.name} disabled={isManaged} onChange={(event) => patch({ name: event.target.value })} />
                 </label>
                 <label className="block">
                     <span className="mb-1 block text-sm font-medium">{t("config.channelEditor.protocol")}</span>
-                    <Select className="w-full" value={draft.apiFormat} options={apiFormatOptions} onChange={changeApiFormat} />
+                    <Select className="w-full" value={draft.apiFormat} options={apiFormatOptions} disabled={isManaged} onChange={changeApiFormat} />
                 </label>
                 <label className="block md:col-span-2">
                     <span className="mb-1 block text-sm font-medium">{t("config.channelEditor.baseUrl")}</span>
-                    <Input value={draft.baseUrl} onChange={(event) => patch({ baseUrl: event.target.value })} placeholder="https://api.example.com" />
+                    <Input value={isManaged ? "••••••••••••••••" : draft.baseUrl} disabled={isManaged} onChange={(event) => patch({ baseUrl: event.target.value })} placeholder="https://api.example.com" />
                 </label>
                 <label className="block md:col-span-2">
                     <span className="mb-1 block text-sm font-medium">API Key</span>
-                    <Input type="password" autoComplete="new-password" value={apiKeyDraft} onChange={(event) => setApiKeyDraft(event.target.value)} placeholder={draft.apiKey ? t("config.channelEditor.apiKeyMasked", { masked: maskApiKey(draft.apiKey) }) : "sk-..."} />
-                    <span className="mt-1 block text-xs text-stone-500">{draft.apiKey ? t("config.channelEditor.apiKeyNoPeek") : t("config.channelEditor.hostedKeyHint")}</span>
+                    <Input type="password" autoComplete="new-password" disabled={isManaged} value={apiKeyDraft} onChange={(event) => setApiKeyDraft(event.target.value)} placeholder={draft.apiKey ? t("config.channelEditor.apiKeyMasked", { masked: maskApiKey(draft.apiKey) }) : "sk-..."} />
+                    <span className="mt-1 block text-xs text-stone-500">{isManaged ? t("config.channelEditor.managedKeyHint") : draft.apiKey ? t("config.channelEditor.apiKeyNoPeek") : t("config.channelEditor.hostedKeyHint")}</span>
                 </label>
             </div>
 
@@ -121,21 +125,27 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                     <div className="text-sm font-semibold">{t("config.channelEditor.models")}</div>
                     <div className="mt-0.5 text-xs text-stone-500">{t("config.channelEditor.modelDescription", { count: draft.models.length })}</div>
                 </div>
-                <Button type="primary" icon={<ListPlus className="size-4" />} onClick={() => setSelectOpen(true)}>
-                    {t("config.channelEditor.selectModels")}
-                </Button>
+                {isManaged ? null : (
+                    <Button type="primary" icon={<ListPlus className="size-4" />} onClick={() => setSelectOpen(true)}>
+                        {t("config.channelEditor.selectModels")}
+                    </Button>
+                )}
             </div>
 
-            <p className="mb-3 text-xs text-stone-500">{t("config.channelEditor.capabilityProtocolHint")}</p>
-            <div className="mb-3 flex flex-wrap gap-2">
-                <Input className="min-w-40 flex-1" placeholder={t("config.modelSelect.modelName")} value={manualName} onChange={(event) => setManualName(event.target.value)} />
-                <Select aria-label={t("config.channelEditor.capability")} value={manualCapability} options={capabilityOptions} onChange={(capability) => { setManualCapability(capability); setManualProtocol("auto"); }} style={{ width: 100 }} />
-                <Select aria-label={t("config.channelEditor.modelProtocol")} value={manualProtocol} options={protocolOptions(manualCapability)} onChange={setManualProtocol} style={{ width: 200 }} />
-                <Button disabled={!manualName.trim() || draft.models.some((model) => model.name === manualName.trim())} onClick={() => { setModels([...draft.models, { name: manualName.trim(), capability: manualCapability, protocol: manualProtocol }]); setManualName(""); }}>
-                    {t("config.modelSelect.add")}
-                </Button>
-            </div>
-            {protocolHint(manualCapability, manualProtocol) && <p className="mb-3 text-xs text-stone-500">{protocolHint(manualCapability, manualProtocol)}</p>}
+            {isManaged ? null : (
+                <>
+                    <p className="mb-3 text-xs text-stone-500">{t("config.channelEditor.capabilityProtocolHint")}</p>
+                    <div className="mb-3 flex flex-wrap gap-2">
+                        <Input className="min-w-40 flex-1" placeholder={t("config.modelSelect.modelName")} value={manualName} onChange={(event) => setManualName(event.target.value)} />
+                        <Select aria-label={t("config.channelEditor.capability")} value={manualCapability} options={capabilityOptions} onChange={(capability) => { setManualCapability(capability); setManualProtocol("auto"); }} style={{ width: 100 }} />
+                        <Select aria-label={t("config.channelEditor.modelProtocol")} value={manualProtocol} options={protocolOptions(manualCapability)} onChange={setManualProtocol} style={{ width: 200 }} />
+                        <Button disabled={!manualName.trim() || draft.models.some((model) => model.name === manualName.trim())} onClick={() => { setModels([...draft.models, { name: manualName.trim(), capability: manualCapability, protocol: manualProtocol }]); setManualName(""); }}>
+                            {t("config.modelSelect.add")}
+                        </Button>
+                    </div>
+                    {protocolHint(manualCapability, manualProtocol) && <p className="mb-3 text-xs text-stone-500">{protocolHint(manualCapability, manualProtocol)}</p>}
+                </>
+            )}
             <p className="mb-3 text-xs text-stone-500">{t("config.modelSelect.description")}</p>
             <div className="space-y-2 rounded-lg border border-stone-200 p-2 dark:border-stone-800">
                 {draft.models.length ? (
@@ -150,26 +160,32 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                                     {model.name}
                                 </span>
                                 <div className="flex flex-wrap items-center gap-2">
-                                    <Segmented size="small" aria-label={t("config.channelEditor.capability")} value={model.capability} options={capabilityOptions} onChange={(value) => setCapability(model.name, value as ModelCapability)} />
-                                    <Select size="small" aria-label={t("config.channelEditor.modelProtocol")} value={protocol} options={protocolOptions(model.capability)} onChange={(protocol) => setProtocol(model.name, protocol)} style={{ width: 200 }} />
-                                    {model.capability === "video" ? (
-                                        <InputNumber
-                                            size="small"
-                                            min={1}
-                                            max={VIDEO_SECONDS_MAX}
-                                            step={1}
-                                            value={model.maxSeconds ?? null}
-                                            placeholder={t("config.channelEditor.maxSecondsPlaceholder")}
-                                            aria-label={t("config.channelEditor.maxSeconds")}
-                                            onChange={(value) => setMaxSeconds(model.name, typeof value === "number" ? value : null)}
-                                            style={{ width: 92 }}
-                                            addonAfter="s"
-                                        />
-                                    ) : null}
-                                    <Button size="small" type={hasScript && !scriptIgnored ? "primary" : "default"} ghost={hasScript && !scriptIgnored} onClick={() => setScriptTarget({ name: model.name, capability: model.capability, value: model.script || "" })}>
-                                        {t(scriptIgnored ? "config.channelEditor.scriptInactive" : hasScript ? "config.channelEditor.scriptReady" : "config.channelEditor.script")}
-                                    </Button>
-                                    <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => removeModel(model.name)} />
+                                    {isManaged ? (
+                                        <span className="text-xs text-stone-500">{t(`config.channelEditor.capabilities.${model.capability}`)} · {t(`config.channelEditor.modelProtocols.${protocol}`)}</span>
+                                    ) : (
+                                        <>
+                                            <Segmented size="small" aria-label={t("config.channelEditor.capability")} value={model.capability} options={capabilityOptions} onChange={(value) => setCapability(model.name, value as ModelCapability)} />
+                                            <Select size="small" aria-label={t("config.channelEditor.modelProtocol")} value={protocol} options={protocolOptions(model.capability)} onChange={(protocol) => setProtocol(model.name, protocol)} style={{ width: 200 }} />
+                                            {model.capability === "video" ? (
+                                                <InputNumber
+                                                    size="small"
+                                                    min={1}
+                                                    max={VIDEO_SECONDS_MAX}
+                                                    step={1}
+                                                    value={model.maxSeconds ?? null}
+                                                    placeholder={t("config.channelEditor.maxSecondsPlaceholder")}
+                                                    aria-label={t("config.channelEditor.maxSeconds")}
+                                                    onChange={(value) => setMaxSeconds(model.name, typeof value === "number" ? value : null)}
+                                                    style={{ width: 92 }}
+                                                    addonAfter="s"
+                                                />
+                                            ) : null}
+                                            <Button size="small" type={hasScript && !scriptIgnored ? "primary" : "default"} ghost={hasScript && !scriptIgnored} onClick={() => setScriptTarget({ name: model.name, capability: model.capability, value: model.script || "" })}>
+                                                {t(scriptIgnored ? "config.channelEditor.scriptInactive" : hasScript ? "config.channelEditor.scriptReady" : "config.channelEditor.script")}
+                                            </Button>
+                                            <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={() => removeModel(model.name)} />
+                                        </>
+                                    )}
                                 </div>
                                 <p className="w-full text-xs text-stone-500">{protocolHint(model.capability, protocol)}</p>
                                 {scriptIgnored && <p className="w-full text-xs text-stone-500">{t("config.channelEditor.scriptIgnoredHint")}</p>}
