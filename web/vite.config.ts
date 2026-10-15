@@ -69,11 +69,13 @@ export default defineConfig({
     preview: { proxy: process.env.CANVAS_SAME_ORIGIN_PROXY === "1" ? {
         "/canvas-api": { target: "http://127.0.0.1:23210", rewrite: (path) => path.replace(/^\/canvas-api/, ""), timeout: 180000, proxyTimeout: 180000 },
         "/admin-api": { target: "http://127.0.0.1:23210", timeout: 30000, proxyTimeout: 30000 },
+        "/auth": { target: "http://127.0.0.1:23210", timeout: 30000, proxyTimeout: 30000 },
     } : {} },
     // Opt in only on the localhost server deployment; static hosting stays unchanged.
     server: { proxy: process.env.CANVAS_SAME_ORIGIN_PROXY === "1" ? {
         "/canvas-api": { target: "http://127.0.0.1:23210", rewrite: (path) => path.replace(/^\/canvas-api/, ""), timeout: 180000, proxyTimeout: 180000 },
         "/admin-api": { target: "http://127.0.0.1:23210", timeout: 30000, proxyTimeout: 30000 },
+        "/auth": { target: "http://127.0.0.1:23210", timeout: 30000, proxyTimeout: 30000 },
     } : {} },
     define: {
         "import.meta.env.VITE_CANVAS_SAME_ORIGIN_PROXY": JSON.stringify(process.env.CANVAS_SAME_ORIGIN_PROXY === "1" ? "1" : "0"),

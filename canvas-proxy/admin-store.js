@@ -155,6 +155,28 @@ export function authenticate(key, fingerprint, meta = {}) {
     return { ok: true, key: record, device };
 }
 
+/**
+ * 只读门禁探测（供 GET /auth/verify 全屏密钥门使用）：
+ * 与 authenticate 同一套判定，但不登记设备、不更新活跃时间、不写审计——纯读。
+ * 未登记设备且有余量时返回 pendingBind:true（首次真实请求时会由 authenticate 绑定）。
+ */
+export function verifyAccess(key, fingerprint) {
+    if (state.accessKeys.length === 0) return { enforcement: false, valid: true };
+    if (!key) return { enforcement: true, valid: false, code: "KEY_REQUIRED" };
+    const record = findAccessKey(key);
+    if (!record) return { enforcement: true, valid: false, code: "KEY_INVALID" };
+    if (record.revokedAt) return { enforcement: true, valid: false, code: "KEY_REVOKED" };
+    if (record.expiresAt && Date.now() > record.expiresAt) return { enforcement: true, valid: false, code: "KEY_EXPIRED" };
+    if (!fingerprint) return { enforcement: true, valid: false, code: "DEVICE_REQUIRED" };
+    const device = state.devices.find((d) => d.key === key && d.fingerprint === fingerprint);
+    if (device) {
+        if (device.blockedAt) return { enforcement: true, valid: false, code: "DEVICE_BLOCKED" };
+        return { enforcement: true, valid: true, keyName: record.name, expiresAt: record.expiresAt };
+    }
+    if (deviceCount(key) >= record.maxDevices) return { enforcement: true, valid: false, code: "DEVICE_LIMIT" };
+    return { enforcement: true, valid: true, keyName: record.name, expiresAt: record.expiresAt, pendingBind: true };
+}
+
 export function setDeviceBlocked(id, blocked) {
     const device = state.devices.find((d) => d.id === id);
     if (!device) return null;

@@ -129,6 +129,27 @@ export function onAuthError(handler: (payload: { code?: string; error?: string }
     return () => window.removeEventListener(AUTH_ERROR_EVENT, listener);
 }
 
+// ---------- 全屏密钥门：只读探测（GET /auth/verify，不产生设备绑定副作用） ----------
+
+export type AccessVerifyResult = {
+    enforcement: boolean;
+    valid: boolean;
+    code?: string;
+    keyName?: string;
+    expiresAt?: number | null;
+    pendingBind?: boolean;
+};
+
+/** 调用代理端 /auth/verify 校验当前（或 override）密钥。override 用于门内提交时先验后存。 */
+export async function verifyAccessKey(overrideKey?: string): Promise<AccessVerifyResult> {
+    const headers = overrideKey
+        ? { "x-access-key": overrideKey, "x-device-id": getDeviceFingerprint() }
+        : accessAuthHeaders();
+    const response = await fetch("/auth/verify", { headers, cache: "no-store", signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error(`verify http ${response.status}`);
+    return (await response.json()) as AccessVerifyResult;
+}
+
 // ---------- 自定义渠道上报（记录不可变，仅管理员可删） ----------
 
 function readReportedSet() {

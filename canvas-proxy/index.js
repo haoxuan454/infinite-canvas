@@ -21,6 +21,20 @@ const SKIP_REQUEST_HEADERS = new Set(["host", "connection", "content-length", "a
 /** fetch() already decoded and re-framed the body, so the upstream framing headers no longer apply. */
 const SKIP_RESPONSE_HEADERS = new Set(["content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"]);
 
+/** /auth/verify 同 IP 限流：每分钟 30 次（滑动窗口，超限 429），防 Key 状态探测滥用。 */
+const verifyRate = new Map();
+function verifyRateOk(ip) {
+    const now = Date.now();
+    let entry = verifyRate.get(ip);
+    if (!entry || now - entry.windowStart > 60_000) {
+        entry = { count: 0, windowStart: now };
+        verifyRate.set(ip, entry);
+        if (verifyRate.size > 10_000) for (const [key, value] of verifyRate) if (now - value.windowStart > 60_000) verifyRate.delete(key);
+    }
+    entry.count += 1;
+    return entry.count <= 30;
+}
+
 function readArg(args, name, fallback) {
     const index = args.indexOf(`--${name}`);
     return index >= 0 && args[index + 1] ? args[index + 1] : fallback;
@@ -227,6 +241,16 @@ export function createProxyServer() {
         }
         if (path === "/report-channel") {
             handleReportChannel(req, res).catch(() => sendJson(res, 500, { error: "上报失败" }));
+            return;
+        }
+        // 全屏密钥门探测端点（免鉴权、只读、同 IP 限流 30 次/分钟）：前端启动/刷新时调用。
+        if (path === "/auth/verify") {
+            if (!verifyRateOk(req.socket?.remoteAddress || "")) {
+                sendJson(res, 429, { error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" });
+                return;
+            }
+            const result = adminStore.verifyAccess(req.headers["x-access-key"], req.headers["x-device-id"]);
+            sendJson(res, 200, result);
             return;
         }
         const target = readTarget(req.url || "/");

@@ -1,7 +1,8 @@
 // 管理后台（/admin）：访问 Key 签发与吊销 / 设备指纹台账 / 托管上游渠道 / 自定义渠道上报（不可变）/ 审计。
 // 设计语言：Linear/Supabase 式数据密集仪表盘（参考 VoltAgent/awesome-design-md），layui 式后台组件形态，
 // quark 式轻盈动效；密钥与指纹一律等宽字体；状态使用带圆点的胶囊 Tag。
-import { Alert, App, Button, Card, Descriptions, Drawer, Empty, Input, InputNumber, Modal, Popconfirm, Radio, Segmented, Space, Table, Tabs, Tag, Typography } from "antd";
+import { Alert, App, Button, Card, DatePicker, Descriptions, Drawer, Empty, Input, InputNumber, Modal, Popconfirm, Segmented, Select, Space, Table, Tabs, Tag, Typography } from "antd";
+import dayjs, { type Dayjs } from "dayjs";
 import { Activity, CheckCircle2, Copy, Fingerprint, KeyRound, Link2, Plus, RefreshCw, ShieldAlert, ShieldCheck, Trash2, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -62,13 +63,46 @@ function StatusDot({ tone }: { tone: "green" | "red" | "amber" | "gray" }) {
     return <span className="mr-1.5 inline-block size-1.5 rounded-full" style={{ background: color, boxShadow: `0 0 6px ${color}` }} />;
 }
 
-const EXPIRY_PRESETS = [
-    { value: 7, label: "7天" },
-    { value: 30, label: "30天" },
-    { value: 90, label: "90天" },
-    { value: 365, label: "1年" },
-    { value: 0, label: "永久" },
+// ---------- 精细有效期：相对时长（分钟级）/ 绝对时间（分钟级）/ 永久 ----------
+type ExpiryMode = "relative" | "absolute" | "never";
+type ExpiryUnit = "minutes" | "hours" | "days" | "weeks" | "months";
+const EXPIRY_UNITS: { value: ExpiryUnit; labelKey: string; dayjsUnit: "minute" | "hour" | "day" | "week" | "month" }[] = [
+    { value: "minutes", labelKey: "admin.keys.unitMinutes", dayjsUnit: "minute" },
+    { value: "hours", labelKey: "admin.keys.unitHours", dayjsUnit: "hour" },
+    { value: "days", labelKey: "admin.keys.unitDays", dayjsUnit: "day" },
+    { value: "weeks", labelKey: "admin.keys.unitWeeks", dayjsUnit: "week" },
+    { value: "months", labelKey: "admin.keys.unitMonths", dayjsUnit: "month" },
 ];
+const QUICK_PRESETS: { amount: number; unit: ExpiryUnit; labelKey: string }[] = [
+    { amount: 10, unit: "minutes", labelKey: "admin.keys.preset10min" },
+    { amount: 1, unit: "hours", labelKey: "admin.keys.preset1hour" },
+    { amount: 6, unit: "hours", labelKey: "admin.keys.preset6hour" },
+    { amount: 1, unit: "days", labelKey: "admin.keys.preset1day" },
+    { amount: 7, unit: "days", labelKey: "admin.keys.preset7day" },
+    { amount: 30, unit: "days", labelKey: "admin.keys.preset30day" },
+];
+const MAX_EXPIRY_YEARS = 100;
+/** 由数量+单位计算到期毫秒时间戳（dayjs 日历精确：跨月按日历月）；超界抛错防 Invalid Date→NaN→永久 Key。 */
+const computeExpiry = (amount: number, unit: ExpiryUnit) => {
+    const def = EXPIRY_UNITS.find((u) => u.value === unit);
+    const expiresAt = dayjs().add(Math.max(1, Math.floor(amount)), def?.dayjsUnit || "minute").valueOf();
+    if (!Number.isFinite(expiresAt) || expiresAt > Date.now() + MAX_EXPIRY_YEARS * 365 * 86_400_000) throw new Error("expiry_out_of_range");
+    return expiresAt;
+};
+/** 剩余时间文案（页面 30s 心跳驱动刷新）。 */
+function remainingText(expiresAt: number | null, now: number, labels: { never: string; expired: string; soon: string; day: string; hour: string; minute: string }) {
+    if (!expiresAt) return labels.never;
+    const diff = expiresAt - now;
+    if (diff <= 0) return labels.expired;
+    const minutes = Math.floor(diff / 60_000);
+    if (minutes < 1) return labels.soon;
+    const days = Math.floor(minutes / 1440);
+    const hours = Math.floor((minutes % 1440) / 60);
+    const mins = minutes % 60;
+    if (days > 0) return `${labels.day.replace("{n}", String(days))}${hours > 0 ? labels.hour.replace("{n}", String(hours)) : ""}`;
+    if (hours > 0) return `${labels.hour.replace("{n}", String(hours))}${mins > 0 ? labels.minute.replace("{n}", String(mins)) : ""}`;
+    return labels.minute.replace("{n}", String(minutes));
+}
 
 export default function AdminPage() {
     const { message } = App.useApp();
@@ -133,20 +167,52 @@ export default function AdminPage() {
     };
 
     // ---------- 密钥签发 ----------
-    const [issueForm, setIssueForm] = useState({ name: "", expiryDays: 30, maxDevices: 1, note: "" });
+    const [issueForm, setIssueForm] = useState<{ name: string; expiryMode: ExpiryMode; expiryAmount: number; expiryUnit: ExpiryUnit; expiryDate: Dayjs | null; maxDevices: number; note: string }>({ name: "", expiryMode: "relative", expiryAmount: 30, expiryUnit: "days", expiryDate: null, maxDevices: 1, note: "" });
     const issueKey = async () => {
         if (!issueForm.name.trim()) { message.warning(t("admin.keys.nameRequired")); return; }
-        const expiresAt = issueForm.expiryDays > 0 ? Date.now() + issueForm.expiryDays * 86_400_000 : null;
-        const data = await adminFetch<{ key: AccessKey }>("/keys", { method: "POST", body: JSON.stringify({ name: issueForm.name.trim(), expiresAt, maxDevices: issueForm.maxDevices, note: issueForm.note }) });
-        setIssuedKey(data.key);
-        setIssueOpen(false);
-        setIssueForm({ name: "", expiryDays: 30, maxDevices: 1, note: "" });
+        let expiresAt: number | null = null;
+        try {
+            if (issueForm.expiryMode === "relative") expiresAt = computeExpiry(issueForm.expiryAmount, issueForm.expiryUnit);
+            else if (issueForm.expiryMode === "absolute") {
+                if (!issueForm.expiryDate || issueForm.expiryDate.valueOf() <= Date.now()) { message.warning(t("admin.keys.expiryPast")); return; }
+                expiresAt = issueForm.expiryDate.valueOf();
+            }
+        } catch {
+            message.warning(t("admin.keys.expiryOutOfRange"));
+            return;
+        }
+        try {
+            const data = await adminFetch<{ key: AccessKey }>("/keys", { method: "POST", body: JSON.stringify({ name: issueForm.name.trim(), expiresAt, maxDevices: issueForm.maxDevices, note: issueForm.note }) });
+            setIssuedKey(data.key);
+            setIssueOpen(false);
+        setIssueForm({ name: "", expiryMode: "relative", expiryAmount: 30, expiryUnit: "days", expiryDate: null, maxDevices: 1, note: "" });
         await refreshAll();
+        } catch (e) {
+            message.error((e as Error).message);
+        }
     };
+
+    const [nowTick, setNowTick] = useState(Date.now());
+    useEffect(() => {
+        const id = window.setInterval(() => setNowTick(Date.now()), 30_000);
+        return () => window.clearInterval(id);
+    }, []);
 
     const revokeKey = (key: string) => adminFetch(`/keys/${encodeURIComponent(key)}`, { method: "PATCH", body: JSON.stringify({ revoke: true }) }).then(refreshAll).catch((e) => message.error(e.message));
     const deleteKey = (key: string) => adminFetch(`/keys/${encodeURIComponent(key)}`, { method: "DELETE" }).then(refreshAll).catch((e) => message.error(e.message));
-    const extendKey = (key: string, days: number) => adminFetch(`/keys/${encodeURIComponent(key)}`, { method: "PATCH", body: JSON.stringify({ expiresAt: Date.now() + days * 86_400_000 }) }).then(() => { message.success(t("admin.keys.extended")); return refreshAll(); }).catch((e) => message.error(e.message));
+    const [renewTarget, setRenewTarget] = useState<AccessKey | null>(null);
+    const [renewForm, setRenewForm] = useState<{ amount: number; unit: ExpiryUnit }>({ amount: 30, unit: "days" });
+    const renewKey = async () => {
+        if (!renewTarget) return;
+        let expiresAt: number;
+        try {
+            expiresAt = computeExpiry(renewForm.amount, renewForm.unit);
+        } catch {
+            message.warning(t("admin.keys.expiryOutOfRange"));
+            return;
+        }
+        await adminFetch(`/keys/${encodeURIComponent(renewTarget.key)}`, { method: "PATCH", body: JSON.stringify({ expiresAt }) }).then(() => { message.success(t("admin.keys.extended")); setRenewTarget(null); return refreshAll(); }).catch((e) => message.error(e.message));
+    };
 
     const setDeviceBlocked = (id: string, blocked: boolean) => adminFetch(`/devices/${id}/${blocked ? "block" : "unblock"}`, { method: "POST" }).then(refreshAll).catch((e) => message.error(e.message));
     const deleteDevice = (id: string) => adminFetch(`/devices/${id}`, { method: "DELETE" }).then(refreshAll).catch((e) => message.error(e.message));
@@ -263,14 +329,19 @@ export default function AdminPage() {
                                             { title: t("admin.keys.key"), dataIndex: "keyMasked", render: (v: string) => <span className="font-mono text-xs text-stone-500">{v}</span> },
                                             { title: t("admin.keys.status"), width: 110, render: (_: unknown, k: AccessKey) => { const s = keyStatus(k); return <Tag className="!rounded-full" color={s.tone === "green" ? "green" : s.tone === "amber" ? "gold" : "red"}><StatusDot tone={s.tone} />{s.label}</Tag>; } },
                                             { title: t("admin.keys.devices"), dataIndex: "deviceCount", width: 90, render: (_: unknown, k: AccessKey) => <span className="font-mono">{k.deviceCount}/{k.maxDevices}</span> },
-                                            { title: t("admin.keys.expiresAt"), dataIndex: "expiresAt", width: 150, render: (v: number | null) => <span className="font-mono text-xs">{v ? formatDate(v) : t("admin.keys.never")}</span> },
+                                            { title: t("admin.keys.expiresAt"), dataIndex: "expiresAt", width: 190, render: (v: number | null) => (
+                                                <div className="leading-4">
+                                                    <div className="font-mono text-xs">{v ? formatDate(v) : t("admin.keys.never")}</div>
+                                                    <div className="text-[11px] text-stone-500">{remainingText(v, nowTick, { never: t("admin.keys.never"), expired: t("admin.keys.expiredAlready"), soon: t("admin.keys.remainingSoon"), day: t("admin.keys.remainingDays"), hour: t("admin.keys.remainingHours"), minute: t("admin.keys.remainingMinutes") })}</div>
+                                                </div>
+                                            ) },
                                             { title: t("admin.keys.lastSeen"), width: 90, render: (_: unknown, k: AccessKey) => { const ds = devices.filter((d) => d.key === k.key); const latest = ds.length ? Math.max(...ds.map((d) => d.lastSeen)) : 0; return <span className="font-mono text-xs text-stone-500">{latest ? relativeTime(latest) : "-"}</span>; } },
                                             {
                                                 title: t("admin.keys.actions"),
                                                 width: 220,
                                                 render: (_: unknown, k: AccessKey) => (
                                                     <Space size={4}>
-                                                        {!k.revokedAt ? <Button size="small" onClick={() => void extendKey(k.key, 30)}>{t("admin.keys.extend")}</Button> : null}
+                                                        {!k.revokedAt ? <Button size="small" onClick={() => { setRenewForm({ amount: 30, unit: "days" }); setRenewTarget(k); }}>{t("admin.keys.renew")}</Button> : null}
                                                         {!k.revokedAt ? <Popconfirm title={t("admin.keys.revokeConfirm")} onConfirm={() => void revokeKey(k.key)}><Button size="small" danger>{t("admin.keys.revoke")}</Button></Popconfirm> : null}
                                                         <Popconfirm title={t("admin.keys.deleteConfirm")} onConfirm={() => void deleteKey(k.key)}><Button size="small" type="text" danger icon={<Trash2 className="size-3.5" />} /></Popconfirm>
                                                     </Space>
@@ -406,7 +477,32 @@ export default function AdminPage() {
                     </label>
                     <div>
                         <span className="mb-1 block text-sm font-medium">{t("admin.keys.formExpiry")}</span>
-                        <Radio.Group value={issueForm.expiryDays} onChange={(e) => setIssueForm({ ...issueForm, expiryDays: e.target.value })} optionType="button" buttonStyle="solid" options={EXPIRY_PRESETS} />
+                        <div className="space-y-2">
+                            <Segmented value={issueForm.expiryMode} onChange={(v) => setIssueForm({ ...issueForm, expiryMode: v as ExpiryMode })} options={[{ label: t("admin.keys.formExpiryRelative"), value: "relative" }, { label: t("admin.keys.formExpiryAbsolute"), value: "absolute" }, { label: t("admin.keys.formExpiryNever"), value: "never" }]} />
+                            {issueForm.expiryMode === "relative" ? (
+                                <div className="space-y-2">
+                                    <div className="flex items-center gap-2">
+                                        <InputNumber min={1} max={5_256_000} value={issueForm.expiryAmount} onChange={(v) => setIssueForm({ ...issueForm, expiryAmount: v || 1 })} className="w-28" />
+                                        <Select value={issueForm.expiryUnit} onChange={(v) => setIssueForm({ ...issueForm, expiryUnit: v })} className="w-32" options={EXPIRY_UNITS.map((u) => ({ value: u.value, label: t(u.labelKey) }))} />
+                                    </div>
+                                    <div className="flex flex-wrap gap-1">
+                                        {QUICK_PRESETS.map((preset) => <Button key={preset.labelKey} size="small" onClick={() => setIssueForm({ ...issueForm, expiryAmount: preset.amount, expiryUnit: preset.unit })}>{t(preset.labelKey)}</Button>)}
+                                    </div>
+                                    <span className="block text-xs text-stone-500">{t("admin.keys.formExpiryMinutesHint")}</span>
+                                </div>
+                            ) : null}
+                            {issueForm.expiryMode === "absolute" ? (
+                                <DatePicker
+                                    showTime={{ format: "HH:mm" }}
+                                    format="YYYY-MM-DD HH:mm"
+                                    minuteStep={1}
+                                    value={issueForm.expiryDate}
+                                    onChange={(v) => setIssueForm({ ...issueForm, expiryDate: v })}
+                                    className="!w-full"
+                                    disabledDate={(d) => d.isBefore(dayjs().startOf("day"))}
+                                />
+                            ) : null}
+                        </div>
                     </div>
                     <div>
                         <span className="mb-1 block text-sm font-medium">{t("admin.keys.formMaxDevices")}</span>
@@ -420,13 +516,27 @@ export default function AdminPage() {
                 </div>
             </Modal>
 
+            {/* 自定义续期：数量 + 单位（分钟级） */}
+            <Modal open={Boolean(renewTarget)} title={<span className="inline-flex items-center gap-2"><KeyRound className="size-4 text-emerald-500" />{t("admin.keys.renewTitle")}{renewTarget?.name ? ` · ${renewTarget.name}` : ""}</span>} okText={t("admin.keys.renew")} cancelText={t("common.cancel")} onOk={() => void renewKey()} onCancel={() => setRenewTarget(null)} destroyOnClose>
+                <div className="space-y-3 pt-2">
+                    <div className="flex items-center gap-2">
+                        <InputNumber min={1} max={5_256_000} value={renewForm.amount} onChange={(v) => setRenewForm({ ...renewForm, amount: v || 1 })} className="w-28" />
+                        <Select value={renewForm.unit} onChange={(v) => setRenewForm({ ...renewForm, unit: v })} className="w-32" options={EXPIRY_UNITS.map((u) => ({ value: u.value, label: t(u.labelKey) }))} />
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                        {QUICK_PRESETS.map((preset) => <Button key={preset.labelKey} size="small" onClick={() => setRenewForm({ amount: preset.amount, unit: preset.unit })}>{t(preset.labelKey)}</Button>)}
+                    </div>
+                    <span className="block text-xs text-stone-500">{t("admin.keys.renewHint")}</span>
+                </div>
+            </Modal>
+
             {/* 签发结果：唯一一次展示完整 Key */}
             <Modal open={Boolean(issuedKey)} footer={null} onCancel={() => setIssuedKey(null)} title={<span className="inline-flex items-center gap-2"><CheckCircle2 className="size-4 text-emerald-500" />{t("admin.keys.issuedTitle")}</span>}>
                 <div className="space-y-3 pt-2">
                     <Alert type="warning" showIcon message={t("admin.keys.issuedWarning")} />
                     <Descriptions column={1} size="small" bordered>
                         <Descriptions.Item label={t("admin.keys.name")}>{issuedKey?.name}</Descriptions.Item>
-                        <Descriptions.Item label={t("admin.keys.expiresAt")}>{issuedKey?.expiresAt ? formatDate(issuedKey.expiresAt) : t("admin.keys.never")}</Descriptions.Item>
+                        <Descriptions.Item label={t("admin.keys.expiresAt")}>{issuedKey?.expiresAt ? `${formatDate(issuedKey.expiresAt)}（${remainingText(issuedKey.expiresAt, Date.now(), { never: t("admin.keys.never"), expired: t("admin.keys.expiredAlready"), soon: t("admin.keys.remainingSoon"), day: t("admin.keys.remainingDays"), hour: t("admin.keys.remainingHours"), minute: t("admin.keys.remainingMinutes") })}）` : t("admin.keys.never")}</Descriptions.Item>
                         <Descriptions.Item label="Key">
                             <Space.Compact className="w-full">
                                 <Input readOnly value={issuedKey?.key} className="!font-mono !text-xs" />
