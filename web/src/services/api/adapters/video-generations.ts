@@ -1,6 +1,6 @@
 import axios from "axios";
 
-import { inferVideoRatio } from "@/lib/media-size";
+import { inferVideoRatio, VIDEO_SECONDS_MAX } from "@/lib/media-size";
 import { modelOptionName, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { aiHeaders, apiText, isFailedTaskStatus, readApiErrorMessage, readAxiosError, taskFailure, unwrapEnvelope } from "./video-shared";
 import { VIDEO_REQUEST_TIMEOUT_MS, type VideoAdapterContext, type VideoGenerationResult, type VideoGenerationTask, type VideoGenerationTaskState, type VideoRequestOptions } from "./video-types";
@@ -36,7 +36,7 @@ export async function createVideoGenerationsTask({ config, model, prompt, refere
     // 该接口族为纯文生视频，参考图/视频/音频没有已核实的字段；请求前明确拦截而不是伪造 multipart 能力。
     if (references.length || options?.videos?.length || options?.audios?.length) throw new Error(apiText("videoGenerationsReferencesUnsupported"));
     const seconds = Number(config.videoSeconds);
-    if (!config.videoSeconds.trim() || !Number.isInteger(seconds) || seconds < 1 || seconds > 60) throw new Error(apiText("videoGenerationsDurationInvalid"));
+    if (!config.videoSeconds.trim() || !Number.isInteger(seconds) || seconds < 1 || seconds > VIDEO_SECONDS_MAX) throw new Error(apiText("videoGenerationsDurationInvalid"));
     const ratio = inferVideoRatio(config.size || "16:9");
     const resolution = ({ low: "480p", medium: "720p", high: "720p" } as Record<string, string>)[config.vquality] || (config.vquality === "auto" ? "720p" : `${config.vquality.replace(/p$/i, "")}p`);
     const body = { model: modelOptionName(model), prompt, duration: seconds, resolution, aspect_ratio: ratio === "auto" ? "16:9" : ratio };

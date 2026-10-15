@@ -4,6 +4,7 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { normalizeModelMaxSeconds } from "@/lib/video-duration";
 import { normalizeModelProtocol, resolveModelProtocolExecution, type ApiCallFormat, type ModelCapability, type ModelProtocol } from "@/lib/model-protocol";
 
 export { MODEL_PROTOCOLS, MODEL_PROTOCOLS_BY_CAPABILITY, normalizeModelProtocol, modelProtocolError, resolveModelProtocolExecution } from "@/lib/model-protocol";
@@ -15,6 +16,8 @@ export type ChannelModel = {
     capability: ModelCapability;
     protocol?: ModelProtocol;
     script?: string;
+    /** 视频模型可选的最大生成秒数；不填表示不限。 */
+    maxSeconds?: number;
 };
 
 export type ModelChannel = {
@@ -30,6 +33,7 @@ export type AiConfig = {
     channelMode: "remote" | "local";
     baseUrl: string;
     apiKey: string;
+    accessKey: string;
     apiFormat: ApiCallFormat;
     channels: ModelChannel[];
     modelProtocol?: ModelProtocol;
@@ -68,7 +72,7 @@ export type WebdavSyncConfig = {
     directory: string;
     lastSyncedAt: string;
 };
-export type ConfigTabKey = "channels" | "local-proxy" | "preferences" | "prompt-sources" | "webdav" | "local-storage";
+export type ConfigTabKey = "channels" | "access-key" | "local-proxy" | "preferences" | "prompt-sources" | "webdav" | "local-storage";
 
 export type ChannelCredentialsImportResult = {
     status: "created" | "updated" | "missing-base-url" | "invalid-base-url";
@@ -86,6 +90,7 @@ export const defaultConfig: AiConfig = {
     channelMode: "local",
     baseUrl: OPENAI_BASE_URL,
     apiKey: "",
+    accessKey: "",
     apiFormat: "openai",
     channels: [
         {
@@ -170,7 +175,8 @@ export function guessCapability(name: string): ModelCapability {
     return "text";
 }
 
-function findChannelModel(config: AiConfig, value: string): { channel: ModelChannel; model: ChannelModel } | null {
+/** 按模型键（channelId::name 或裸名）查找渠道与模型配置；页面用 .model.maxSeconds 取每模型上限。 */
+export function findChannelModel(config: AiConfig, value: string): { channel: ModelChannel; model: ChannelModel } | null {
     const decoded = decodeChannelModel(value);
     const name = decoded?.model || value;
     const channel = decoded ? config.channels.find((item) => item.id === decoded.channelId) : config.channels.find((item) => item.models.some((model) => model.name === name));
@@ -319,7 +325,8 @@ export function normalizeChannelModels(models: Array<string | ChannelModel> | un
         const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
         const script = typeof item === "string" ? undefined : item.script?.trim() || undefined;
         const protocol = normalizeModelProtocol(typeof item === "string" ? undefined : item.protocol, capability);
-        result.push({ name, capability, protocol, script });
+        const maxSeconds = typeof item === "string" ? undefined : normalizeModelMaxSeconds(item.maxSeconds);
+        result.push({ name, capability, protocol, script, ...(maxSeconds === undefined ? {} : { maxSeconds }) });
     }
     return result;
 }

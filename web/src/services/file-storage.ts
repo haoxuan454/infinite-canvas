@@ -1,6 +1,7 @@
 import localforage from "localforage";
 import { nanoid } from "nanoid";
 
+import { withAuthHeaders } from "@/lib/access-control";
 import { withLocalProxy } from "@/stores/use-config-store";
 
 export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
@@ -9,7 +10,7 @@ const store = localforage.createInstance({ name: "infinite-canvas", storeName: "
 const objectUrls = new Map<string, string>();
 
 export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
-    const blob = typeof input === "string" ? await (await fetch(withLocalProxy(input))).blob() : input;
+    const blob = typeof input === "string" ? await (await fetch(withLocalProxy(input), { headers: withAuthHeaders() })).blob() : input;
     const storageKey = `${prefix}:${nanoid()}`;
     await store.setItem(storageKey, blob);
     const url = URL.createObjectURL(blob);
@@ -67,12 +68,28 @@ export function collectMediaStorageKeys(value: unknown, keys = new Set<string>()
     return keys;
 }
 
+/** 后台标签页会挂起媒体加载，loadedmetadata/error 可能永不触发；超时兜底避免整条生成链路静默停滞。 */
+const MEDIA_META_TIMEOUT_MS = 8000;
+
 function readVideoMeta(url: string) {
     return new Promise<{ width: number; height: number; durationMs?: number }>((resolve) => {
         const video = document.createElement("video");
-        const done = () => resolve({ width: video.videoWidth || 1280, height: video.videoHeight || 720, durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : undefined });
-        video.onloadedmetadata = done;
-        video.onerror = done;
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            video.onloadedmetadata = null;
+            video.onerror = null;
+            video.removeAttribute("src");
+            resolve({ width: video.videoWidth || 1280, height: video.videoHeight || 720, durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : undefined });
+        };
+        const timer = window.setTimeout(() => {
+            console.warn("[file-storage] video metadata load timeout (background tab suspends media loading); using default dimensions");
+            finish();
+        }, MEDIA_META_TIMEOUT_MS);
+        video.onloadedmetadata = finish;
+        video.onerror = finish;
         video.src = url;
     });
 }
@@ -80,9 +97,21 @@ function readVideoMeta(url: string) {
 function readAudioMeta(url: string) {
     return new Promise<{ durationMs?: number }>((resolve) => {
         const audio = document.createElement("audio");
-        const done = () => resolve({ durationMs: Number.isFinite(audio.duration) ? Math.round(audio.duration * 1000) : undefined });
-        audio.onloadedmetadata = done;
-        audio.onerror = done;
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            audio.onloadedmetadata = null;
+            audio.onerror = null;
+            resolve({ durationMs: Number.isFinite(audio.duration) ? Math.round(audio.duration * 1000) : undefined });
+        };
+        const timer = window.setTimeout(() => {
+            console.warn("[file-storage] audio metadata load timeout (background tab suspends media loading); skipping duration probe");
+            finish();
+        }, MEDIA_META_TIMEOUT_MS);
+        audio.onloadedmetadata = finish;
+        audio.onerror = finish;
         audio.src = url;
     });
 }

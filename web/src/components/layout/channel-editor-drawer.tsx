@@ -1,8 +1,11 @@
-import { Button, Drawer, Input, Segmented, Select, Space } from "antd";
+import { Button, Drawer, Input, InputNumber, Segmented, Select, Space } from "antd";
 import { ListPlus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { reportChannelUsage } from "@/lib/access-control";
+import { maskApiKey } from "@/lib/secret-mask";
+import { VIDEO_SECONDS_MAX } from "@/lib/media-size";
 import { MODEL_PROTOCOLS_BY_CAPABILITY, modelProtocolError, normalizeModelProtocol, type ModelProtocol } from "@/lib/model-protocol";
 import { defaultBaseUrlForApiFormat, guessCapability, normalizeChannelModels, type ApiCallFormat, type ChannelModel, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { ModelScriptEditor } from "./model-script-editor";
@@ -13,6 +16,7 @@ type ScriptTarget = { name: string; capability: ModelCapability; value: string }
 export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: boolean; channel: ModelChannel | null; onSave: (channel: ModelChannel) => void; onClose: () => void }) {
     const { t } = useTranslation();
     const [draft, setDraft] = useState<ModelChannel | null>(channel);
+    const [apiKeyDraft, setApiKeyDraft] = useState("");
     const [selectOpen, setSelectOpen] = useState(false);
     const [manualName, setManualName] = useState("");
     const [manualCapability, setManualCapability] = useState<ModelCapability>("text");
@@ -36,6 +40,7 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
     useEffect(() => {
         if (open && channel) {
             setDraft({ ...channel, models: normalizeChannelModels(channel.models) });
+            setApiKeyDraft("");
             setManualName("");
             setManualCapability("text");
             setManualProtocol("auto");
@@ -61,11 +66,17 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
     const setProtocol = (name: string, protocol: ModelProtocol) => setModels(draft.models.map((model) => (model.name === name ? { ...model, protocol } : model)));
     const missingCustomScript = draft.models.some((model) => Boolean(modelProtocolError(model)));
     const setScript = (name: string, script: string) => setModels(draft.models.map((model) => (model.name === name ? { ...model, script: script || undefined } : model)));
+    const setMaxSeconds = (name: string, value: number | null) => setModels(draft.models.map((model) => (model.name === name ? { ...model, maxSeconds: value || undefined } : model)));
     const removeModel = (name: string) => setModels(draft.models.filter((model) => model.name !== name));
 
     const save = () => {
         if (missingCustomScript) return;
-        onSave({ ...draft, name: draft.name.trim() || t("config.channels.unnamed"), models: normalizeChannelModels(draft.models) });
+        const apiKey = apiKeyDraft.trim() || draft.apiKey;
+        onSave({ ...draft, apiKey, name: draft.name.trim() || t("config.channels.unnamed"), models: normalizeChannelModels(draft.models) });
+        // 自定义渠道使用了自备 Key 时上报管理台账（不可变记录，仅管理员可删）；托管渠道（Key 留空）不上报。
+        if (apiKeyDraft.trim() && apiKeyDraft.trim() !== draft.apiKey) {
+            reportChannelUsage({ baseUrl: draft.baseUrl, apiKey: apiKeyDraft.trim(), model: draft.models.map((m) => m.name).join(",") });
+        }
         onClose();
     };
 
@@ -100,7 +111,8 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                 </label>
                 <label className="block md:col-span-2">
                     <span className="mb-1 block text-sm font-medium">API Key</span>
-                    <Input.Password value={draft.apiKey} onChange={(event) => patch({ apiKey: event.target.value })} placeholder="sk-..." />
+                    <Input type="password" autoComplete="new-password" value={apiKeyDraft} onChange={(event) => setApiKeyDraft(event.target.value)} placeholder={draft.apiKey ? t("config.channelEditor.apiKeyMasked", { masked: maskApiKey(draft.apiKey) }) : "sk-..."} />
+                    <span className="mt-1 block text-xs text-stone-500">{draft.apiKey ? t("config.channelEditor.apiKeyNoPeek") : t("config.channelEditor.hostedKeyHint")}</span>
                 </label>
             </div>
 
@@ -140,6 +152,20 @@ export function ChannelEditorDrawer({ open, channel, onSave, onClose }: { open: 
                                 <div className="flex flex-wrap items-center gap-2">
                                     <Segmented size="small" aria-label={t("config.channelEditor.capability")} value={model.capability} options={capabilityOptions} onChange={(value) => setCapability(model.name, value as ModelCapability)} />
                                     <Select size="small" aria-label={t("config.channelEditor.modelProtocol")} value={protocol} options={protocolOptions(model.capability)} onChange={(protocol) => setProtocol(model.name, protocol)} style={{ width: 200 }} />
+                                    {model.capability === "video" ? (
+                                        <InputNumber
+                                            size="small"
+                                            min={1}
+                                            max={VIDEO_SECONDS_MAX}
+                                            step={1}
+                                            value={model.maxSeconds ?? null}
+                                            placeholder={t("config.channelEditor.maxSecondsPlaceholder")}
+                                            aria-label={t("config.channelEditor.maxSeconds")}
+                                            onChange={(value) => setMaxSeconds(model.name, typeof value === "number" ? value : null)}
+                                            style={{ width: 92 }}
+                                            addonAfter="s"
+                                        />
+                                    ) : null}
                                     <Button size="small" type={hasScript && !scriptIgnored ? "primary" : "default"} ghost={hasScript && !scriptIgnored} onClick={() => setScriptTarget({ name: model.name, capability: model.capability, value: model.script || "" })}>
                                         {t(scriptIgnored ? "config.channelEditor.scriptInactive" : hasScript ? "config.channelEditor.scriptReady" : "config.channelEditor.script")}
                                     </Button>

@@ -1,6 +1,6 @@
-import { App, Button, Form, Input, Modal, Progress, Radio, Select, Switch, Tabs } from "antd";
+import { App, Alert, Button, Form, Input, Modal, Progress, Radio, Select, Switch, Tabs } from "antd";
 import type { TFunction } from "i18next";
-import { Cloud, Download, Pencil, Plus, RefreshCw, Sparkles, Trash2, Upload, Wifi } from "lucide-react";
+import { Cloud, Download, KeyRound, Pencil, Plus, RefreshCw, Sparkles, Trash2, Upload, Wifi } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -223,6 +223,31 @@ export function AppConfigPanel({ showDoneButton = false, initialTab = "channels"
                                         </div>
                                     ))}
                                 </div>
+                            </div>
+                        ),
+                    },
+                    {
+                        key: "access-key",
+                        label: t("config.tabs.accessKey"),
+                        children: (
+                            <div className="max-w-xl space-y-3">
+                                <div className="flex items-center gap-2 text-sm font-semibold">
+                                    <KeyRound className="size-4 text-emerald-500" />
+                                    {t("accessKey.title")}
+                                </div>
+                                <p className="text-xs text-stone-500">{t("accessKey.description")}</p>
+                                <Input.Password
+                                    value={config.accessKey}
+                                    onChange={(event) => updateConfig("accessKey", event.target.value.trim())}
+                                    placeholder="cak-..."
+                                    autoComplete="new-password"
+                                />
+                                <Alert
+                                    type="info"
+                                    showIcon
+                                    message={config.accessKey ? t("accessKey.stateSet") : t("accessKey.stateEmpty")}
+                                    description={t("accessKey.stateDescription")}
+                                />
                             </div>
                         ),
                     },

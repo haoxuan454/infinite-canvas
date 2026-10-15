@@ -12,13 +12,14 @@ import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { VideoSettingsPanel, normalizeVideoResolutionValue, normalizeVideoSizeValue, videoModeLabel, videoSizeLabel } from "@/components/video-settings-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { clampVideoSeconds } from "@/lib/media-size";
+import { clampVideoSecondsForModel } from "@/lib/video-duration";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { deleteStoredMedia, resolveMediaUrl } from "@/services/file-storage";
 import { resolveImageUrl, ensureImagePreview, getImagePreviewRevision, previewUrlFor, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
 import { createVideoGenerationTask, pollVideoGenerationTask, storeGeneratedVideo, type VideoGenerationTask } from "@/services/api/video";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
-import { boolConfig, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { boolConfig, findChannelModel, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { ReferenceImage } from "@/types/image";
 import i18n from "@/i18n";
@@ -231,7 +232,13 @@ export default function VideoPage() {
             openConfigDialog(true);
             return null;
         }
-        return { text, config: buildVideoConfig(effectiveConfig, model), references: [...references] };
+        const modelMaxSeconds = findChannelModel(effectiveConfig, model)?.model.maxSeconds;
+        const requestedSeconds = Number(clampVideoSeconds(effectiveConfig.videoSeconds));
+        if (modelMaxSeconds && String(effectiveConfig.videoSeconds).trim() !== "-1" && requestedSeconds > modelMaxSeconds) {
+            message.error(t("videoWorkbench.exceedsModelMax", { max: modelMaxSeconds }));
+            return null;
+        }
+        return { text, config: buildVideoConfig(effectiveConfig, model, modelMaxSeconds), references: [...references] };
     };
 
     const retryResult = () => {
@@ -782,13 +789,13 @@ function buildLog({ prompt, model, config, references, durationMs, status, task,
     };
 }
 
-function buildVideoConfig(config: AiConfig, model: string): AiConfig {
+function buildVideoConfig(config: AiConfig, model: string, maxSeconds?: number): AiConfig {
     return {
         ...config,
         model,
         videoModel: model,
         size: normalizeVideoSize(config.size),
-        videoSeconds: normalizeVideoSeconds(config.videoSeconds),
+        videoSeconds: normalizeVideoSeconds(config.videoSeconds, maxSeconds),
         vquality: normalizeResolution(config.vquality),
         videoGenerateAudio: String(boolConfig(config.videoGenerateAudio, true)),
         videoWatermark: String(boolConfig(config.videoWatermark, false)),
@@ -796,9 +803,9 @@ function buildVideoConfig(config: AiConfig, model: string): AiConfig {
     };
 }
 
-function normalizeVideoSeconds(value: string) {
+function normalizeVideoSeconds(value: string, maxSeconds?: number) {
     if (String(value).trim() === "-1") return "-1";
-    return clampVideoSeconds(value);
+    return clampVideoSecondsForModel(value, maxSeconds);
 }
 
 function normalizeVideoSize(value: string) {

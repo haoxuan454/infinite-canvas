@@ -3,6 +3,8 @@ import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { Readable, Transform } from "node:stream";
 import { createRequestLog, ERROR_SAMPLE_BYTES, readRuntime, redact, safeError, safeTarget, sampledError } from "./request-log.js";
+import * as adminStore from "./admin-store.js";
+import { AUTH_ERRORS, handleAdminApi, handleReportChannel } from "./admin-api.js";
 
 const pkg = createRequire(import.meta.url)("./package.json");
 
@@ -15,7 +17,7 @@ const CORS_HEADERS = {
 };
 
 /** Headers that describe the hop to this proxy rather than the upstream request. */
-const SKIP_REQUEST_HEADERS = new Set(["host", "connection", "content-length", "accept-encoding", "origin", "referer", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site"]);
+const SKIP_REQUEST_HEADERS = new Set(["host", "connection", "content-length", "accept-encoding", "origin", "referer", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "x-access-key", "x-device-id", "x-admin-token"]);
 /** fetch() already decoded and re-framed the body, so the upstream framing headers no longer apply. */
 const SKIP_RESPONSE_HEADERS = new Set(["content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"]);
 
@@ -126,7 +128,11 @@ async function forward(req, res, target, log) {
                 if (typeof model === "string") record.model = redact(model, 128);
             } catch {}
         }
-        const upstream = await fetch(target, { method: req.method, headers: requestHeaders(req), body, redirect: "follow", signal: controller.signal });
+        // 托管渠道：按最长前缀匹配注入服务器持有的上游 Key（浏览器不接触上游 Key）。
+        const upstreamHeaders = requestHeaders(req);
+        const channel = adminStore.matchChannelForTarget(target);
+        if (channel) upstreamHeaders.authorization = `Bearer ${channel.apiKey}`;
+        const upstream = await fetch(target, { method: req.method, headers: upstreamHeaders, body, redirect: "follow", signal: controller.signal });
         if (settled) {
             await upstream.body?.cancel();
             return;
@@ -213,9 +219,26 @@ export function createProxyServer() {
             res.end();
             return;
         }
+        if (path === "/admin-api" || path.startsWith("/admin-api/")) {
+            handleAdminApi(req, res).catch((error) => {
+                if (!res.headersSent) sendJson(res, 500, { error: safeError(error).message });
+            });
+            return;
+        }
+        if (path === "/report-channel") {
+            handleReportChannel(req, res).catch(() => sendJson(res, 500, { error: "上报失败" }));
+            return;
+        }
         const target = readTarget(req.url || "/");
         if (!target) {
-            sendJson(res, 200, { app: "infinite-canvas", proxy: pkg.name, version: pkg.version, usage: "/<full-target-url>" });
+            const stats = adminStore.overview();
+            sendJson(res, 200, { app: "infinite-canvas", proxy: pkg.name, version: pkg.version, usage: "/<full-target-url>", authEnforcement: stats.enforcement });
+            return;
+        }
+        // 访问 Key + 设备绑定强制校验（引导模式：尚未签发任何 Key 时放行并照常登记设备）。
+        const auth = adminStore.authenticate(req.headers["x-access-key"], req.headers["x-device-id"], { ip: req.socket?.remoteAddress || "", userAgent: req.headers["user-agent"] || "" });
+        if (!auth.ok) {
+            sendJson(res, auth.status, { error: AUTH_ERRORS[auth.code] || "访问被拒绝", code: auth.code });
             return;
         }
         forward(req, res, target, log).catch(() => {

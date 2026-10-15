@@ -44,7 +44,7 @@ export const videoRatioOptions = [
 ] as const;
 
 export const VIDEO_SECONDS_MIN = 4;
-export const VIDEO_SECONDS_MAX = 30;
+export const VIDEO_SECONDS_MAX = 120;
 
 export function normalizeMediaScale(value: string | undefined) {
     const scale = String(value || "").trim().toLowerCase();

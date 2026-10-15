@@ -1,4 +1,5 @@
 export type LogError = { code: string; message: string; traceId: string };
+import { withAuthHeaders } from "@/lib/access-control";
 
 export type RequestLog = {
     id: string;
@@ -25,7 +26,7 @@ export class LogApiError extends Error {
 }
 
 async function fetchLogs<T extends { items: unknown[]; total: number }>(path: string, signal: AbortSignal): Promise<T> {
-    const response = await fetch(`/canvas-api/${path}`, { signal, cache: "no-store" });
+    const response = await fetch(`/canvas-api/${path}`, { signal, cache: "no-store", headers: withAuthHeaders() });
     let data;
     try {
         data = await response.json();

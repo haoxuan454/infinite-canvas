@@ -1,12 +1,13 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
+import { isDurationUnsupportedError } from "@/lib/video-duration";
 import { getMediaBlob, resolveMediaUrl } from "@/services/file-storage";
 import { buildApiUrl, modelOptionName, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { VIDEO_REQUEST_TIMEOUT_MS, type VideoGenerationResult, type VideoGenerationTaskState, type VideoRequestOptions } from "./video-types";
 
 export function taskFailure(error?: unknown): VideoGenerationTaskState {
-    return { status: "failed", error: readApiErrorMessage(error) || apiText("videoGenerationFailed") };
+    return { status: "failed", error: friendlyVideoError(readApiErrorMessage(error)) || apiText("videoGenerationFailed") };
 }
 
 export function isFailedTaskStatus(status: unknown) {
@@ -77,10 +78,15 @@ export function readAxiosError(error: unknown, fallback: string) {
     if (axios.isCancel(error)) return apiText("requestCanceled");
     if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; message?: string; code?: number | string }>(error)) {
         if (!error.response && error.code === "ERR_NETWORK") return apiText("requestFailed");
-        return readApiErrorMessage(error.response?.data) || statusMessage(error.response?.status, fallback);
+        return friendlyVideoError(readApiErrorMessage(error.response?.data)) || statusMessage(error.response?.status, fallback);
     }
     if (error instanceof DOMException && error.name === "AbortError") return apiText("requestCanceled");
-    return error instanceof Error ? readApiErrorMessage(error.message) || error.message : fallback;
+    return error instanceof Error ? friendlyVideoError(readApiErrorMessage(error.message)) || error.message : fallback;
+}
+
+/** 时长类上游报错转译为可操作的中文提示；其余错误原文透传。 */
+function friendlyVideoError(message: string) {
+    return message && isDurationUnsupportedError(message) ? apiText("videoDurationUnsupported") : message;
 }
 
 export function statusMessage(status: number | undefined, fallback: string) {
