@@ -4,6 +4,7 @@ import { inferVideoRatio, VIDEO_SECONDS_MAX } from "@/lib/media-size";
 import { modelOptionName, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { aiHeaders, apiText, isFailedTaskStatus, readApiErrorMessage, readAxiosError, taskFailure, unwrapEnvelope } from "./video-shared";
 import { VIDEO_REQUEST_TIMEOUT_MS, type VideoAdapterContext, type VideoGenerationResult, type VideoGenerationTask, type VideoGenerationTaskState, type VideoRequestOptions } from "./video-types";
+import type { ReferenceVideo } from "@/types/media";
 
 // sub.callai.one 风格的 JSON 视频任务接口：创建 /v1/videos/generations，查询 /v1/videos/{id}，下载 /v1/videos/{id}/content。
 type GenerationsVideoPayload = {
@@ -15,6 +16,11 @@ type GenerationsVideoPayload = {
     video_url?: unknown;
     url?: unknown;
 };
+
+// 2026-10-16 服务器实测（3s/480p 最低配置）：该接口族支持图生视频（image_url）与参考视频（video_url），
+// 均接受 data URL；参考音频字段未核实，仍然明确拦截。多张参考图走 images 数组字段（未单测，创建失败自动回退单图）。
+// 时长实测（480p）：3/6/10/15 秒创建并出片成功；30 秒（含 grok-imagine-video-1.5）上游返回 400「xAI upstream returned status 400」。
+const GENERATIONS_DURATION_MAX = 15;
 
 /** 根/Base URL/完整 create 端点统一归一化到版本根（不含 /videos/generations）。 */
 function normalizeVersionBase(baseUrl: string) {
@@ -42,25 +48,70 @@ function pollUrl(config: Pick<AiConfig, "baseUrl">, taskId: string) {
 }
 
 export async function createVideoGenerationsTask({ config, model, prompt, references, options }: VideoAdapterContext): Promise<VideoGenerationTask> {
-    // 该接口族为纯文生视频，参考图/视频/音频没有已核实的字段；请求前明确拦截而不是伪造 multipart 能力。
-    if (references.length || options?.videos?.length || options?.audios?.length) throw new Error(apiText("videoGenerationsReferencesUnsupported"));
+    // 参考音频没有已核实的字段，明确拦截而不是伪造能力；参考图/参考视频按实测字段组装。
+    if (options?.audios?.length && !references.length && !options?.videos?.length) throw new Error(apiText("videoGenerationsReferencesUnsupported"));
     const seconds = Number(config.videoSeconds);
     if (!config.videoSeconds.trim() || !Number.isInteger(seconds) || seconds < 1 || seconds > VIDEO_SECONDS_MAX) throw new Error(apiText("videoGenerationsDurationInvalid"));
+    if (seconds > GENERATIONS_DURATION_MAX) throw new Error(apiText("videoGenerationsDurationLimit"));
     const ratio = inferVideoRatio(config.size || "16:9");
     const resolution = ({ low: "480p", medium: "720p", high: "720p" } as Record<string, string>)[config.vquality] || (config.vquality === "auto" ? "720p" : `${config.vquality.replace(/p$/i, "")}p`);
-    const body = { model: modelOptionName(model), prompt, duration: seconds, resolution, aspect_ratio: ratio === "auto" ? "16:9" : ratio };
+    const base = { model: modelOptionName(model), prompt, duration: seconds, resolution, aspect_ratio: ratio === "auto" ? "16:9" : ratio };
+    const imageRef = references[0];
+    const videoRef = options?.videos?.[0];
+    const videoDataUrl = videoRef ? await referenceVideoToDataUrl(videoRef) : "";
+    // 多张参考图：先带 images 数组尝试（上游官方上限 7 张），被拒则回退仅第一张的 image_url。
+    const buildBody = (withImages: boolean) => {
+        const body: Record<string, unknown> = { ...base };
+        if (withImages && imageRef && references.length > 1) body.images = references.map((r) => r.dataUrl);
+        if (imageRef) body.image_url = imageRef.dataUrl;
+        if (videoDataUrl) body.video_url = videoDataUrl;
+        return body;
+    };
+    const withImages = Boolean(imageRef && references.length > 1);
     try {
-        const { data } = await axios.post<GenerationsVideoPayload>(createUrl(config), body, {
+        const { data } = await axios.post<GenerationsVideoPayload>(createUrl(config), buildBody(withImages), {
             headers: aiHeaders(config, "application/json"), signal: options?.signal, timeout: VIDEO_REQUEST_TIMEOUT_MS,
         });
-        const created = unwrapEnvelope<GenerationsVideoPayload>(data, apiText("noVideoTaskId"));
-        const taskId = [created.request_id, created.id].find((value): value is string => typeof value === "string" && !!value.trim());
-        if (!taskId) throw new Error(apiText("noVideoTaskId"));
-        return { id: taskId.trim(), provider: "video-generations", model };
+        const taskId = readCreatedTaskId(unwrapEnvelope<GenerationsVideoPayload>(data, apiText("noVideoTaskId")));
+        if (taskId) return { id: taskId, provider: "video-generations", model };
+        throw new Error(apiText("noVideoTaskId"));
     } catch (error) {
         if (axios.isCancel(error) || options?.signal?.aborted) throw error;
+        // images 数组字段未核实：上游拒绝时回退为已核实的单图 image_url 重新创建一次（400 类错误不产生计费任务）。
+        if (withImages && isClientError(error)) {
+            try {
+                const { data } = await axios.post<GenerationsVideoPayload>(createUrl(config), buildBody(false), {
+                    headers: aiHeaders(config, "application/json"), signal: options?.signal, timeout: VIDEO_REQUEST_TIMEOUT_MS,
+                });
+                const taskId = readCreatedTaskId(unwrapEnvelope<GenerationsVideoPayload>(data, apiText("noVideoTaskId")));
+                if (taskId) return { id: taskId, provider: "video-generations", model };
+            } catch (retryError) {
+                if (axios.isCancel(retryError) || options?.signal?.aborted) throw retryError;
+                throw new Error(readAxiosError(retryError, apiText("videoTaskCreateFailed")));
+            }
+        }
         throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
     }
+}
+
+function readCreatedTaskId(payload: GenerationsVideoPayload) {
+    return [payload.request_id, payload.id].find((value): value is string => typeof value === "string" && !!value.trim())?.trim();
+}
+
+function isClientError(error: unknown) {
+    const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+    return status !== undefined && status >= 400 && status < 500;
+}
+
+async function referenceVideoToDataUrl(video: ReferenceVideo): Promise<string> {
+    const { data: blob } = await axios.get<Blob>(withLocalProxy(video.url), { responseType: "blob", timeout: VIDEO_REQUEST_TIMEOUT_MS });
+    if (!blob.size) throw new Error(apiText("invalidReferenceVideo"));
+    return await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error(apiText("invalidReferenceVideo")));
+        reader.readAsDataURL(blob);
+    });
 }
 
 export async function pollVideoGenerationsTask(config: AiConfig, task: VideoGenerationTask, options?: VideoRequestOptions): Promise<VideoGenerationTaskState> {
