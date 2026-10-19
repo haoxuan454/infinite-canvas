@@ -44,7 +44,8 @@ export const videoRatioOptions = [
 ] as const;
 
 export const VIDEO_SECONDS_MIN = 4;
-export const VIDEO_SECONDS_MAX = 120;
+// 2026-10-16 全局上限从 120 收敛到 60：主流模型时长上限不超过 60 秒（用户决策）。
+export const VIDEO_SECONDS_MAX = 60;
 
 export function normalizeMediaScale(value: string | undefined) {
     const scale = String(value || "").trim().toLowerCase();

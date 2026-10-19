@@ -15,6 +15,9 @@ export async function requestArkSeedreamImages({ config, prompt, references, cou
         ...(background ? { background } : {}),
         response_format: "b64_json",
         output_format: "png",
+        // 方舟 Seedream 默认 watermark=true 会在图片右下角合成「AI生成」水印（服务端叠加，提示词无法去除）。
+        // 2026-10-16 依用户决策强制关闭：API 已按量计费，成片不应带水印。
+        watermark: false,
     }, {
         headers: helpers.headers(config, "application/json"),
         signal: options?.signal,
